@@ -222,11 +222,27 @@ class Table:
 
         return doc_ids
 
-    def all(self) -> List[Document]:
+    def all(
+        self,
+        limit: Optional[int] = None,
+        skip: int = 0
+    ) -> List[Document]:
         """
         Get all documents stored in the table.
 
+        :param limit: maximum number of documents to return (default: no limit)
+        :param skip: number of documents to skip from the beginning
+                     (default: 0)
         :returns: a list with all documents.
+
+        Example usage:
+
+        >>> # Get first 10 documents
+        >>> db.all(limit=10)
+        >>> # Skip first 20 and get next 10 documents
+        >>> db.all(limit=10, skip=20)
+        >>> # Skip first 5 documents
+        >>> db.all(skip=5)
         """
 
         # iter(self) (implemented in Table.__iter__ provides an iterator
@@ -234,21 +250,41 @@ class Table:
         # of all documents by using the ``list`` constructor to perform the
         # conversion.
 
-        return list(iter(self))
+        docs = list(iter(self))
+        return self._apply_pagination(docs, skip, limit)
 
-    def search(self, cond: QueryLike) -> List[Document]:
+    def search(
+        self,
+        cond: QueryLike,
+        limit: Optional[int] = None,
+        skip: int = 0
+    ) -> List[Document]:
         """
         Search for all documents matching a 'where' cond.
 
         :param cond: the condition to check against
+        :param limit: maximum number of documents to return (default: no limit)
+        :param skip: number of documents to skip from the beginning
+                     (default: 0)
         :returns: list of matching documents
+
+        Example usage:
+
+        >>> # Get first 10 matching documents
+        >>> db.search(where('type') == 'user', limit=10)
+        >>> # Skip first 20 and get next 10 matching documents
+        >>> db.search(where('type') == 'user', limit=10, skip=20)
+        >>> # Skip first 5 matching documents
+        >>> db.search(where('type') == 'user', skip=5)
         """
 
         # First, we check the query cache to see if it has results for this
         # query
         cached_results = self._query_cache.get(cond)
         if cached_results is not None:
-            return cached_results[:]
+            # Apply skip and limit to cached results
+            docs = cached_results[:]
+            return self._apply_pagination(docs, skip, limit)
 
         # Perform the search by applying the query to all documents.
         # Then, only if the document matches the query, convert it
@@ -275,10 +311,11 @@ class Table:
         is_cacheable: Callable[[], bool] = getattr(cond, 'is_cacheable',
                                                    lambda: True)
         if is_cacheable():
-            # Update the query cache
+            # Update the query cache with full results (before pagination)
             self._query_cache[cond] = docs[:]
 
-        return docs
+        # Apply skip and limit to results
+        return self._apply_pagination(docs, skip, limit)
 
     def get(
         self,
@@ -640,6 +677,50 @@ class Table:
         """
 
         self._query_cache.clear()
+
+    def _apply_pagination(
+        self,
+        docs: List[Document],
+        skip: int,
+        limit: Optional[int]
+    ) -> List[Document]:
+        """
+        Apply skip and limit pagination to a list of documents.
+
+        :param docs: the list of documents to paginate
+        :param skip: number of documents to skip from the beginning.
+                     When skip is 0 (default), no documents are skipped
+                     and pagination starts from the first document.
+        :param limit: maximum number of documents to return.
+                      When limit is None (default), all remaining documents
+                      after skip are returned (no limit applied).
+        :returns: paginated list of documents
+
+        :raises ValueError: if skip is negative or limit is negative
+
+        Examples:
+            - skip=0, limit=None: returns all documents (no pagination)
+            - skip=5, limit=None: skips first 5, returns all remaining
+            - skip=0, limit=10: returns first 10 documents
+            - skip=5, limit=10: skips first 5, returns next 10 documents
+        """
+        if skip < 0:
+            raise ValueError(
+                f'skip must be a non-negative integer, got {skip}'
+            )
+
+        if limit is not None and limit < 0:
+            raise ValueError(
+                f'limit must be a non-negative integer or None, got {limit}'
+            )
+
+        if skip:
+            docs = docs[skip:]
+
+        if limit is not None:
+            docs = docs[:limit]
+
+        return docs
 
     def __len__(self):
         """

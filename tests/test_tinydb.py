@@ -714,3 +714,211 @@ def test_lambda_query():
     query.is_cacheable = lambda: False
     assert db.search(query) == [{'foo': 'bar'}]
     assert not db._query_cache
+
+
+def test_search_with_limit():
+    db = TinyDB(storage=MemoryStorage)
+    db.insert_multiple({'int': i} for i in range(10))
+
+    # Test limit
+    results = db.search(where('int').exists(), limit=5)
+    assert len(results) == 5
+
+    # Test limit larger than result set
+    results = db.search(where('int').exists(), limit=100)
+    assert len(results) == 10
+
+    # Test limit of 0
+    results = db.search(where('int').exists(), limit=0)
+    assert len(results) == 0
+
+    # Test no limit (default behavior)
+    results = db.search(where('int').exists())
+    assert len(results) == 10
+
+
+def test_search_with_skip():
+    db = TinyDB(storage=MemoryStorage)
+    db.insert_multiple({'int': i} for i in range(10))
+
+    # Test skip
+    results = db.search(where('int').exists(), skip=3)
+    assert len(results) == 7
+
+    # Test skip larger than result set
+    results = db.search(where('int').exists(), skip=100)
+    assert len(results) == 0
+
+    # Test skip of 0 (default behavior)
+    results = db.search(where('int').exists(), skip=0)
+    assert len(results) == 10
+
+
+def test_search_with_limit_and_skip():
+    db = TinyDB(storage=MemoryStorage)
+    db.insert_multiple({'int': i} for i in range(10))
+
+    # Test combined limit and skip
+    results = db.search(where('int').exists(), limit=3, skip=2)
+    assert len(results) == 3
+
+    # Test skip + limit exceeding result set
+    results = db.search(where('int').exists(), limit=10, skip=8)
+    assert len(results) == 2
+
+    # Test skip beyond result set with limit
+    results = db.search(where('int').exists(), limit=5, skip=15)
+    assert len(results) == 0
+
+
+def test_search_pagination_with_cache():
+    db = TinyDB(storage=MemoryStorage)
+    db.insert_multiple({'int': i} for i in range(10))
+
+    query = where('int').exists()
+
+    # First search populates cache
+    assert not db._query_cache
+    results1 = db.search(query, limit=3)
+    assert len(results1) == 3
+    assert len(db._query_cache) == 1
+
+    # Cache stores full results, not paginated
+    cached = db._query_cache.get(query)
+    assert len(cached) == 10
+
+    # Second search uses cache but applies different pagination
+    results2 = db.search(query, limit=5, skip=2)
+    assert len(results2) == 5
+
+
+def test_all_with_limit():
+    db = TinyDB(storage=MemoryStorage)
+    db.insert_multiple({'int': i} for i in range(10))
+
+    # Test limit
+    results = db.all(limit=5)
+    assert len(results) == 5
+
+    # Test limit larger than result set
+    results = db.all(limit=100)
+    assert len(results) == 10
+
+    # Test limit of 0
+    results = db.all(limit=0)
+    assert len(results) == 0
+
+    # Test no limit (default behavior)
+    results = db.all()
+    assert len(results) == 10
+
+
+def test_all_with_skip():
+    db = TinyDB(storage=MemoryStorage)
+    db.insert_multiple({'int': i} for i in range(10))
+
+    # Test skip
+    results = db.all(skip=3)
+    assert len(results) == 7
+
+    # Test skip larger than result set
+    results = db.all(skip=100)
+    assert len(results) == 0
+
+    # Test skip of 0 (default behavior)
+    results = db.all(skip=0)
+    assert len(results) == 10
+
+
+def test_all_with_limit_and_skip():
+    db = TinyDB(storage=MemoryStorage)
+    db.insert_multiple({'int': i} for i in range(10))
+
+    # Test combined limit and skip
+    results = db.all(limit=3, skip=2)
+    assert len(results) == 3
+
+    # Test skip + limit exceeding result set
+    results = db.all(limit=10, skip=8)
+    assert len(results) == 2
+
+    # Test skip beyond result set with limit
+    results = db.all(limit=5, skip=15)
+    assert len(results) == 0
+
+
+def test_pagination_preserves_document_order():
+    db = TinyDB(storage=MemoryStorage)
+    db.insert_multiple({'int': i} for i in range(10))
+
+    # Get all documents
+    all_docs = db.all()
+
+    # Verify pagination preserves order
+    page1 = db.all(limit=3)
+    page2 = db.all(limit=3, skip=3)
+    page3 = db.all(limit=3, skip=6)
+    page4 = db.all(limit=3, skip=9)
+
+    assert page1 == all_docs[0:3]
+    assert page2 == all_docs[3:6]
+    assert page3 == all_docs[6:9]
+    assert page4 == all_docs[9:12]  # Only 1 document
+
+
+def test_table_pagination(db: TinyDB):
+    """Test pagination works on table level too."""
+    table = db.table('test_table')
+    table.insert_multiple({'int': i} for i in range(10))
+
+    # Test search with pagination
+    results = table.search(where('int').exists(), limit=5)
+    assert len(results) == 5
+
+    # Test all with pagination
+    results = table.all(limit=5, skip=2)
+    assert len(results) == 5
+
+
+def test_search_negative_limit_raises_error():
+    db = TinyDB(storage=MemoryStorage)
+    db.insert_multiple({'int': i} for i in range(5))
+
+    with pytest.raises(ValueError, match='limit must be a non-negative integer'):
+        db.search(where('int').exists(), limit=-1)
+
+    with pytest.raises(ValueError, match='limit must be a non-negative integer'):
+        db.search(where('int').exists(), limit=-10)
+
+
+def test_search_negative_skip_raises_error():
+    db = TinyDB(storage=MemoryStorage)
+    db.insert_multiple({'int': i} for i in range(5))
+
+    with pytest.raises(ValueError, match='skip must be a non-negative integer'):
+        db.search(where('int').exists(), skip=-1)
+
+    with pytest.raises(ValueError, match='skip must be a non-negative integer'):
+        db.search(where('int').exists(), skip=-10)
+
+
+def test_all_negative_limit_raises_error():
+    db = TinyDB(storage=MemoryStorage)
+    db.insert_multiple({'int': i} for i in range(5))
+
+    with pytest.raises(ValueError, match='limit must be a non-negative integer'):
+        db.all(limit=-1)
+
+    with pytest.raises(ValueError, match='limit must be a non-negative integer'):
+        db.all(limit=-10)
+
+
+def test_all_negative_skip_raises_error():
+    db = TinyDB(storage=MemoryStorage)
+    db.insert_multiple({'int': i} for i in range(5))
+
+    with pytest.raises(ValueError, match='skip must be a non-negative integer'):
+        db.all(skip=-1)
+
+    with pytest.raises(ValueError, match='skip must be a non-negative integer'):
+        db.all(skip=-10)
