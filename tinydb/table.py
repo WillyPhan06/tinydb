@@ -22,6 +22,9 @@ from .utils import LRUCache
 
 __all__ = ('Document', 'Table')
 
+#: The key used to mark documents as soft-deleted
+SOFT_DELETE_KEY = '_deleted'
+
 
 class Document(dict):
     """
@@ -225,7 +228,8 @@ class Table:
     def all(
         self,
         limit: Optional[int] = None,
-        skip: int = 0
+        skip: int = 0,
+        include_deleted: bool = False
     ) -> List[Document]:
         """
         Get all documents stored in the table.
@@ -233,6 +237,8 @@ class Table:
         :param limit: maximum number of documents to return (default: no limit)
         :param skip: number of documents to skip from the beginning
                      (default: 0)
+        :param include_deleted: If True, include soft-deleted documents.
+                               Default is False.
         :returns: a list with all documents.
 
         Example usage:
@@ -245,19 +251,21 @@ class Table:
         >>> db.all(skip=5)
         """
 
-        # iter(self) (implemented in Table.__iter__ provides an iterator
-        # that returns all documents in this table. We use it to get a list
-        # of all documents by using the ``list`` constructor to perform the
-        # conversion.
-
-        docs = list(iter(self))
+        # Get documents from the table, optionally including deleted ones
+        docs = [
+            self.document_class(doc, self.document_id_class(doc_id))
+            for doc_id, doc in self._read_table(
+                include_deleted=include_deleted
+            ).items()
+        ]
         return self._apply_pagination(docs, skip, limit)
 
     def search(
         self,
         cond: QueryLike,
         limit: Optional[int] = None,
-        skip: int = 0
+        skip: int = 0,
+        include_deleted: bool = False
     ) -> List[Document]:
         """
         Search for all documents matching a 'where' cond.
@@ -266,6 +274,8 @@ class Table:
         :param limit: maximum number of documents to return (default: no limit)
         :param skip: number of documents to skip from the beginning
                      (default: 0)
+        :param include_deleted: If True, include soft-deleted documents.
+                               Default is False.
         :returns: list of matching documents
 
         Example usage:
@@ -278,41 +288,48 @@ class Table:
         >>> db.search(where('type') == 'user', skip=5)
         """
 
-        # First, we check the query cache to see if it has results for this
-        # query
-        cached_results = self._query_cache.get(cond)
-        if cached_results is not None:
-            # Apply skip and limit to cached results
-            docs = cached_results[:]
-            return self._apply_pagination(docs, skip, limit)
+        # Note: We don't use the query cache when include_deleted is True
+        # because the cache only stores results for non-deleted documents
+        if not include_deleted:
+            # First, we check the query cache to see if it has results for
+            # this query
+            cached_results = self._query_cache.get(cond)
+            if cached_results is not None:
+                # Apply skip and limit to cached results
+                docs = cached_results[:]
+                return self._apply_pagination(docs, skip, limit)
 
         # Perform the search by applying the query to all documents.
         # Then, only if the document matches the query, convert it
         # to the document class and document ID class.
         docs = [
             self.document_class(doc, self.document_id_class(doc_id))
-            for doc_id, doc in self._read_table().items()
+            for doc_id, doc in self._read_table(
+                include_deleted=include_deleted
+            ).items()
             if cond(doc)
         ]
 
-        # Only cache cacheable queries.
-        #
-        # This weird `getattr` dance is needed to make MyPy happy as
-        # it doesn't know that a query might have a `is_cacheable` method
-        # that is not declared in the `QueryLike` protocol due to it being
-        # optional.
-        # See: https://github.com/python/mypy/issues/1424
-        #
-        # Note also that by default we expect custom query objects to be
-        # cacheable (which means they need to have a stable hash value).
-        # This is to keep consistency with TinyDB's behavior before
-        # `is_cacheable` was introduced which assumed that all queries
-        # are cacheable.
-        is_cacheable: Callable[[], bool] = getattr(cond, 'is_cacheable',
-                                                   lambda: True)
-        if is_cacheable():
-            # Update the query cache with full results (before pagination)
-            self._query_cache[cond] = docs[:]
+        # Only cache cacheable queries when not including deleted documents
+        if not include_deleted:
+            # Only cache cacheable queries.
+            #
+            # This weird `getattr` dance is needed to make MyPy happy as
+            # it doesn't know that a query might have a `is_cacheable` method
+            # that is not declared in the `QueryLike` protocol due to it being
+            # optional.
+            # See: https://github.com/python/mypy/issues/1424
+            #
+            # Note also that by default we expect custom query objects to be
+            # cacheable (which means they need to have a stable hash value).
+            # This is to keep consistency with TinyDB's behavior before
+            # `is_cacheable` was introduced which assumed that all queries
+            # are cacheable.
+            is_cacheable: Callable[[], bool] = getattr(cond, 'is_cacheable',
+                                                       lambda: True)
+            if is_cacheable():
+                # Update the query cache with full results (before pagination)
+                self._query_cache[cond] = docs[:]
 
         # Apply skip and limit to results
         return self._apply_pagination(docs, skip, limit)
@@ -321,22 +338,25 @@ class Table:
         self,
         cond: Optional[QueryLike] = None,
         doc_id: Optional[int] = None,
-        doc_ids: Optional[List] = None
+        doc_ids: Optional[List] = None,
+        include_deleted: bool = False
     ) -> Optional[Union[Document, List[Document]]]:
         """
         Get exactly one document specified by a query or a document ID.
         However, if multiple document IDs are given then returns all
         documents in a list.
-        
+
         Returns ``None`` if the document doesn't exist.
 
         :param cond: the condition to check against
         :param doc_id: the document's ID
         :param doc_ids: the document's IDs(multiple)
+        :param include_deleted: If True, include soft-deleted documents.
+                               Default is False.
 
         :returns: the document(s) or ``None``
         """
-        table = self._read_table()
+        table = self._read_table(include_deleted=include_deleted)
 
         if doc_id is not None:
             # Retrieve a document specified by its ID
@@ -369,7 +389,9 @@ class Table:
             # doesn't think that `doc_id_` (which is a string) needs
             # to have the same type as `doc_id` which is this function's
             # parameter and is an optional `int`.
-            for doc_id_, doc in self._read_table().items():
+            for doc_id_, doc in self._read_table(
+                include_deleted=include_deleted
+            ).items():
                 if cond(doc):
                     return self.document_class(
                         doc,
@@ -383,7 +405,8 @@ class Table:
     def contains(
         self,
         cond: Optional[QueryLike] = None,
-        doc_id: Optional[int] = None
+        doc_id: Optional[int] = None,
+        include_deleted: bool = False
     ) -> bool:
         """
         Check whether the database contains a document matching a query or
@@ -393,14 +416,17 @@ class Table:
 
         :param cond: the condition use
         :param doc_id: the document ID to look for
+        :param include_deleted: If True, include soft-deleted documents.
+                               Default is False.
         """
         if doc_id is not None:
             # Documents specified by ID
-            return self.get(doc_id=doc_id) is not None
+            return self.get(doc_id=doc_id, include_deleted=include_deleted) \
+                is not None
 
         elif cond is not None:
             # Document specified by condition
-            return self.get(cond) is not None
+            return self.get(cond, include_deleted=include_deleted) is not None
 
         raise RuntimeError('You have to pass either cond or doc_id')
 
@@ -662,14 +688,242 @@ class Table:
         # Reset document ID counter
         self._next_id = None
 
-    def count(self, cond: QueryLike) -> int:
+    def soft_remove(
+        self,
+        cond: Optional[QueryLike] = None,
+        doc_ids: Optional[Iterable[int]] = None,
+    ) -> List[int]:
+        """
+        Soft delete documents by marking them as deleted instead of
+        removing them permanently. Soft-deleted documents are hidden
+        from normal queries but can be restored later.
+
+        :param cond: the condition to check against
+        :param doc_ids: a list of document IDs
+        :returns: a list containing the soft-deleted documents' IDs
+
+        Note: This method clears the query cache since soft-deleted
+        documents are hidden from normal queries.
+        """
+        if doc_ids is not None:
+            soft_deleted_ids = list(doc_ids)
+
+            def updater(table: dict):
+                for doc_id in soft_deleted_ids:
+                    if doc_id in table:
+                        table[doc_id][SOFT_DELETE_KEY] = True
+
+            # _update_table clears the cache after modifying data
+            self._update_table(updater)
+            return soft_deleted_ids
+
+        if cond is not None:
+            soft_deleted_ids: List[int] = []
+
+            def updater(table: dict):
+                _cond = cast(QueryLike, cond)
+
+                for doc_id in list(table.keys()):
+                    doc = table[doc_id]
+                    # Only soft-delete if not already deleted and matches cond
+                    if not doc.get(SOFT_DELETE_KEY, False) and _cond(doc):
+                        soft_deleted_ids.append(doc_id)
+                        table[doc_id][SOFT_DELETE_KEY] = True
+
+            # _update_table clears the cache after modifying data
+            self._update_table(updater)
+            return soft_deleted_ids
+
+        raise RuntimeError('You have to pass either cond or doc_ids')
+
+    def restore(
+        self,
+        cond: Optional[QueryLike] = None,
+        doc_ids: Optional[Iterable[int]] = None,
+    ) -> List[int]:
+        """
+        Restore soft-deleted documents, making them visible again
+        in normal queries.
+
+        When using a condition, the condition is applied to the document
+        WITHOUT the internal ``_deleted`` field, so users work with
+        documents as they originally stored them.
+
+        :param cond: the condition to check against (applied to deleted docs)
+        :param doc_ids: a list of document IDs to restore
+        :returns: a list containing the restored documents' IDs
+
+        Note: This method clears the query cache since restoring documents
+        changes which documents are visible in normal queries.
+        """
+        if doc_ids is not None:
+            restored_ids: List[int] = []
+
+            def updater(table: dict):
+                for doc_id in doc_ids:
+                    if doc_id in table and \
+                            table[doc_id].get(SOFT_DELETE_KEY, False):
+                        del table[doc_id][SOFT_DELETE_KEY]
+                        restored_ids.append(doc_id)
+
+            # _update_table clears the cache after modifying data
+            self._update_table(updater)
+            return restored_ids
+
+        if cond is not None:
+            restored_ids = []
+
+            def updater(table: dict):
+                _cond = cast(QueryLike, cond)
+
+                for doc_id in list(table.keys()):
+                    doc = table[doc_id]
+                    # Only restore if deleted and matches condition
+                    # Strip _deleted key before applying user condition
+                    if doc.get(SOFT_DELETE_KEY, False):
+                        clean_doc = {
+                            k: v for k, v in doc.items()
+                            if k != SOFT_DELETE_KEY
+                        }
+                        if _cond(clean_doc):
+                            restored_ids.append(doc_id)
+                            del table[doc_id][SOFT_DELETE_KEY]
+
+            # _update_table clears the cache after modifying data
+            self._update_table(updater)
+            return restored_ids
+
+        # Restore all soft-deleted documents
+        restored_ids = []
+
+        def updater(table: dict):
+            for doc_id in list(table.keys()):
+                doc = table[doc_id]
+                if doc.get(SOFT_DELETE_KEY, False):
+                    restored_ids.append(doc_id)
+                    del table[doc_id][SOFT_DELETE_KEY]
+
+        # _update_table clears the cache after modifying data
+        self._update_table(updater)
+        return restored_ids
+
+    def deleted(
+        self,
+        cond: Optional[QueryLike] = None,
+        limit: Optional[int] = None,
+        skip: int = 0
+    ) -> List[Document]:
+        """
+        Get all soft-deleted documents, optionally filtered by a condition.
+
+        The returned documents do NOT contain the internal ``_deleted`` field,
+        so users can work with them as normal documents. The condition is
+        also applied to documents without the ``_deleted`` field visible.
+
+        :param cond: optional condition to filter deleted documents
+        :param limit: maximum number of documents to return (default: no limit)
+        :param skip: number of documents to skip from the beginning
+                     (default: 0)
+        :returns: a list of soft-deleted documents (without _deleted field)
+        """
+        # Use centralized _read_table with deleted_only=True to get
+        # only soft-deleted documents (already has _deleted field stripped)
+        table = self._read_table(deleted_only=True)
+
+        # Build list of deleted documents, applying user condition if provided
+        deleted_docs = [
+            self.document_class(doc, self.document_id_class(doc_id))
+            for doc_id, doc in table.items()
+            if cond is None or cond(doc)
+        ]
+
+        return self._apply_pagination(deleted_docs, skip, limit)
+
+    def purge(
+        self,
+        cond: Optional[QueryLike] = None,
+        doc_ids: Optional[Iterable[int]] = None,
+    ) -> List[int]:
+        """
+        Permanently remove soft-deleted documents from the database.
+        This is a destructive operation that cannot be undone.
+
+        If no arguments are provided, all soft-deleted documents will
+        be permanently removed.
+
+        When using a condition, the condition is applied to the document
+        WITHOUT the internal ``_deleted`` field, so users work with
+        documents as they originally stored them.
+
+        :param cond: condition to filter which deleted documents to purge
+        :param doc_ids: specific document IDs to purge (must be soft-deleted)
+        :returns: a list containing the purged documents' IDs
+
+        Note: This method clears the query cache since purging documents
+        removes them from the database entirely.
+        """
+        if doc_ids is not None:
+            purged_ids: List[int] = []
+
+            def updater(table: dict):
+                for doc_id in doc_ids:
+                    # Only purge if the document is soft-deleted
+                    if doc_id in table and \
+                            table[doc_id].get(SOFT_DELETE_KEY, False):
+                        table.pop(doc_id)
+                        purged_ids.append(doc_id)
+
+            # _update_table clears the cache after modifying data
+            self._update_table(updater)
+            return purged_ids
+
+        if cond is not None:
+            purged_ids = []
+
+            def updater(table: dict):
+                _cond = cast(QueryLike, cond)
+
+                for doc_id in list(table.keys()):
+                    doc = table[doc_id]
+                    # Only purge if soft-deleted and matches condition
+                    # Strip _deleted key before applying user condition
+                    if doc.get(SOFT_DELETE_KEY, False):
+                        clean_doc = {
+                            k: v for k, v in doc.items()
+                            if k != SOFT_DELETE_KEY
+                        }
+                        if _cond(clean_doc):
+                            purged_ids.append(doc_id)
+                            table.pop(doc_id)
+
+            # _update_table clears the cache after modifying data
+            self._update_table(updater)
+            return purged_ids
+
+        # Purge all soft-deleted documents
+        purged_ids = []
+
+        def updater(table: dict):
+            for doc_id in list(table.keys()):
+                doc = table[doc_id]
+                if doc.get(SOFT_DELETE_KEY, False):
+                    purged_ids.append(doc_id)
+                    table.pop(doc_id)
+
+        # _update_table clears the cache after modifying data
+        self._update_table(updater)
+        return purged_ids
+
+    def count(self, cond: QueryLike, include_deleted: bool = False) -> int:
         """
         Count the documents matching a query.
 
         :param cond: the condition use
+        :param include_deleted: If True, include soft-deleted documents.
+                               Default is False.
         """
 
-        return len(self.search(cond))
+        return len(self.search(cond, include_deleted=include_deleted))
 
     def clear_cache(self) -> None:
         """
@@ -724,19 +978,19 @@ class Table:
 
     def __len__(self):
         """
-        Count the total number of documents in this table.
+        Count the total number of non-deleted documents in this table.
         """
 
         return len(self._read_table())
 
     def __iter__(self) -> Iterator[Document]:
         """
-        Iterate over all documents stored in the table.
+        Iterate over all non-deleted documents stored in the table.
 
-        :returns: an iterator over all documents.
+        :returns: an iterator over all non-deleted documents.
         """
 
-        # Iterate all documents and their IDs
+        # Iterate all documents and their IDs (excluding soft-deleted)
         for doc_id, doc in self._read_table().items():
             # Convert documents to the document class
             yield self.document_class(doc, self.document_id_class(doc_id))
@@ -776,13 +1030,25 @@ class Table:
 
         return next_id
 
-    def _read_table(self) -> Dict[str, Mapping]:
+    def _read_table(
+        self,
+        include_deleted: bool = False,
+        deleted_only: bool = False
+    ) -> Dict[str, Mapping]:
         """
         Read the table data from the underlying storage.
 
         Documents and doc_ids are NOT yet transformed, as
         we may not want to convert *all* documents when returning
         only one document for example.
+
+        The returned documents always have the internal ``_deleted`` field
+        stripped so users never see implementation details.
+
+        :param include_deleted: If True, include soft-deleted documents.
+                               Default is False (exclude deleted documents).
+        :param deleted_only: If True, return ONLY soft-deleted documents.
+                            This takes precedence over include_deleted.
         """
 
         # Retrieve the tables from the storage
@@ -799,7 +1065,44 @@ class Table:
             # The table does not exist yet, so it is empty
             return {}
 
+        # Apply soft-delete filtering based on parameters and always strip
+        # the _deleted field so users never see internal implementation details
+        if deleted_only:
+            # Return only soft-deleted documents (with _deleted field stripped)
+            table = {
+                doc_id: self._strip_soft_delete_key(doc)
+                for doc_id, doc in table.items()
+                if doc.get(SOFT_DELETE_KEY, False)
+            }
+        elif not include_deleted:
+            # Exclude soft-deleted documents (default behavior)
+            # Non-deleted docs don't have _deleted field, but strip anyway
+            # for consistency
+            table = {
+                doc_id: self._strip_soft_delete_key(doc)
+                for doc_id, doc in table.items()
+                if not doc.get(SOFT_DELETE_KEY, False)
+            }
+        else:
+            # include_deleted=True: return all documents with _deleted stripped
+            table = {
+                doc_id: self._strip_soft_delete_key(doc)
+                for doc_id, doc in table.items()
+            }
+
         return table
+
+    def _strip_soft_delete_key(self, doc: Mapping) -> dict:
+        """
+        Return a copy of the document with the soft-delete key removed.
+
+        This ensures users don't see internal implementation details
+        in their documents.
+
+        :param doc: The document to strip the key from
+        :returns: A new dict without the SOFT_DELETE_KEY
+        """
+        return {k: v for k, v in doc.items() if k != SOFT_DELETE_KEY}
 
     def _update_table(self, updater: Callable[[Dict[int, Mapping]], None]):
         """
