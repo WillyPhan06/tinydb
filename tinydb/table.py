@@ -4,6 +4,7 @@ data in TinyDB.
 """
 
 from typing import (
+    Any,
     Callable,
     Dict,
     Iterable,
@@ -19,6 +20,7 @@ from typing import (
 from .queries import QueryLike
 from .storages import Storage
 from .utils import LRUCache
+from .hooks import HookEvent, HookManager
 
 __all__ = ('Document', 'Table')
 
@@ -103,7 +105,8 @@ class Table:
         storage: Storage,
         name: str,
         cache_size: int = default_query_cache_capacity,
-        persist_empty: bool = False
+        persist_empty: bool = False,
+        hooks: Optional[HookManager] = None
     ):
         """
         Create a table instance.
@@ -113,6 +116,7 @@ class Table:
         self._name = name
         self._query_cache: LRUCache[QueryLike, List[Document]] \
             = self.query_cache_class(capacity=cache_size)
+        self._hooks = hooks
 
         self._next_id = None
         if persist_empty:
@@ -165,6 +169,15 @@ class Table:
             # In all other cases we use the next free ID
             doc_id = self._get_next_id()
 
+        # Prepare a copy of the document for hooks
+        doc_copy = dict(document)
+
+        # Run before-insert hooks
+        self._run_hooks(
+            HookEvent.BEFORE_INSERT,
+            [{'doc_id': doc_id, **doc_copy}]
+        )
+
         # Now, we update the table and add the document
         def updater(table: dict):
             if doc_id in table:
@@ -179,6 +192,12 @@ class Table:
         # See below for details on ``Table._update``
         self._update_table(updater)
 
+        # Run after-insert hooks
+        self._run_hooks(
+            HookEvent.AFTER_INSERT,
+            [{'doc_id': doc_id, **doc_copy}]
+        )
+
         return doc_id
 
     def insert_multiple(self, documents: Iterable[Mapping]) -> List[int]:
@@ -188,7 +207,9 @@ class Table:
         :param documents: an Iterable of documents to insert
         :returns: a list containing the inserted documents' IDs
         """
-        doc_ids = []
+        doc_ids: List[int] = []
+        # Store document copies for hooks (built during updater)
+        hook_docs: List[Dict] = []
 
         def updater(table: dict):
             for document in documents:
@@ -210,7 +231,9 @@ class Table:
                     # skip the rest of the current loop
                     doc_id = document.doc_id
                     doc_ids.append(doc_id)
-                    table[doc_id] = dict(document)
+                    doc_copy = dict(document)
+                    hook_docs.append({'doc_id': doc_id, **doc_copy})
+                    table[doc_id] = doc_copy
                     continue
 
                 # Generate new document ID for this document
@@ -218,10 +241,41 @@ class Table:
                 # later, then save the document with the new doc_id
                 doc_id = self._get_next_id()
                 doc_ids.append(doc_id)
-                table[doc_id] = dict(document)
+                doc_copy = dict(document)
+                hook_docs.append({'doc_id': doc_id, **doc_copy})
+                table[doc_id] = doc_copy
+
+        # Run before-insert hooks (we need to pre-process documents first)
+        # Convert documents to list to allow iteration twice
+        documents = list(documents)
+
+        # Pre-calculate doc_ids for before hooks
+        before_hook_docs: List[Dict] = []
+        temp_next_id = self._next_id
+        table_snapshot = self._read_table(include_deleted=True)
+        for document in documents:
+            if isinstance(document, self.document_class):
+                doc_id = document.doc_id
+            else:
+                if temp_next_id is not None:
+                    doc_id = temp_next_id
+                    temp_next_id = doc_id + 1
+                elif not table_snapshot:
+                    doc_id = 1
+                    temp_next_id = 2
+                else:
+                    max_id = max(self.document_id_class(i) for i in table_snapshot.keys())
+                    doc_id = max_id + 1
+                    temp_next_id = doc_id + 1
+            before_hook_docs.append({'doc_id': doc_id, **dict(document)})
+
+        self._run_hooks(HookEvent.BEFORE_INSERT, before_hook_docs)
 
         # See below for details on ``Table._update``
         self._update_table(updater)
+
+        # Run after-insert hooks
+        self._run_hooks(HookEvent.AFTER_INSERT, hook_docs)
 
         return doc_ids
 
@@ -446,6 +500,13 @@ class Table:
         :returns: a list containing the updated document's ID
         """
 
+        # Check if hooks are registered to avoid unnecessary work
+        has_hooks = self._has_hooks(HookEvent.BEFORE_UPDATE, HookEvent.AFTER_UPDATE)
+
+        # Store documents for hooks (only if hooks are registered)
+        before_hook_docs: List[Dict[str, Any]] = []
+        after_hook_docs: List[Dict[str, Any]] = []
+
         # Define the function that will perform the update
         if callable(fields):
             def perform_update(table, doc_id):
@@ -463,13 +524,37 @@ class Table:
 
             updated_ids = list(doc_ids)
 
+            # Prepare before-hook documents (only if hooks are registered)
+            if has_hooks:
+                table_snapshot = self._read_table(include_deleted=True)
+                for doc_id in updated_ids:
+                    str_doc_id = str(doc_id)
+                    if str_doc_id in table_snapshot:
+                        before_hook_docs.append({
+                            'doc_id': doc_id,
+                            **dict(table_snapshot[str_doc_id])
+                        })
+
+                # Run before-update hooks
+                self._run_hooks(HookEvent.BEFORE_UPDATE, before_hook_docs)
+
             def updater(table: dict):
                 # Call the processing callback with all document IDs
                 for doc_id in updated_ids:
                     perform_update(table, doc_id)
+                    # Capture updated document for after hooks (only if needed)
+                    if has_hooks:
+                        after_hook_docs.append({
+                            'doc_id': doc_id,
+                            **dict(table[doc_id])
+                        })
 
             # Perform the update operation (see _update_table for details)
             self._update_table(updater)
+
+            # Run after-update hooks
+            if has_hooks:
+                self._run_hooks(HookEvent.AFTER_UPDATE, after_hook_docs)
 
             return updated_ids
 
@@ -477,7 +562,7 @@ class Table:
             # Perform the update operation for documents specified by a query
 
             # Collect affected doc_ids
-            updated_ids = []
+            updated_ids: List[int] = []
 
             def updater(table: dict):
                 _cond = cast(QueryLike, cond)
@@ -491,14 +576,47 @@ class Table:
                     # Pass through all documents to find documents matching the
                     # query. Call the processing callback with the document ID
                     if _cond(table[doc_id]):
+                        # Capture document before update for hooks (only if needed)
+                        if has_hooks:
+                            before_hook_docs.append({
+                                'doc_id': doc_id,
+                                **dict(table[doc_id])
+                            })
+
                         # Add ID to list of updated documents
                         updated_ids.append(doc_id)
 
                         # Perform the update (see above)
                         perform_update(table, doc_id)
 
+                        # Capture updated document for after hooks (only if needed)
+                        if has_hooks:
+                            after_hook_docs.append({
+                                'doc_id': doc_id,
+                                **dict(table[doc_id])
+                            })
+
+            # Run before-update hooks (need to find matching docs first)
+            if has_hooks:
+                table_snapshot = self._read_table(include_deleted=True)
+                _cond = cast(QueryLike, cond)
+                for str_doc_id, doc in table_snapshot.items():
+                    if _cond(doc):
+                        before_hook_docs.append({
+                            'doc_id': self.document_id_class(str_doc_id),
+                            **dict(doc)
+                        })
+                self._run_hooks(HookEvent.BEFORE_UPDATE, before_hook_docs)
+
+                # Reset for actual update
+                before_hook_docs.clear()
+
             # Perform the update operation (see _update_table for details)
             self._update_table(updater)
+
+            # Run after-update hooks
+            if has_hooks:
+                self._run_hooks(HookEvent.AFTER_UPDATE, after_hook_docs)
 
             return updated_ids
 
@@ -506,6 +624,18 @@ class Table:
             # Update all documents unconditionally
 
             updated_ids = []
+
+            # Prepare before-hook documents (only if hooks are registered)
+            if has_hooks:
+                table_snapshot = self._read_table(include_deleted=True)
+                for str_doc_id, doc in table_snapshot.items():
+                    before_hook_docs.append({
+                        'doc_id': self.document_id_class(str_doc_id),
+                        **dict(doc)
+                    })
+
+                # Run before-update hooks
+                self._run_hooks(HookEvent.BEFORE_UPDATE, before_hook_docs)
 
             def updater(table: dict):
                 # Process all documents
@@ -516,8 +646,19 @@ class Table:
                     # Perform the update (see above)
                     perform_update(table, doc_id)
 
+                    # Capture updated document for after hooks (only if needed)
+                    if has_hooks:
+                        after_hook_docs.append({
+                            'doc_id': doc_id,
+                            **dict(table[doc_id])
+                        })
+
             # Perform the update operation (see _update_table for details)
             self._update_table(updater)
+
+            # Run after-update hooks
+            if has_hooks:
+                self._run_hooks(HookEvent.AFTER_UPDATE, after_hook_docs)
 
             return updated_ids
 
@@ -533,6 +674,16 @@ class Table:
         :returns: a list containing the updated document's ID
         """
 
+        # Check if hooks are registered to avoid unnecessary work
+        has_hooks = self._has_hooks(HookEvent.BEFORE_UPDATE, HookEvent.AFTER_UPDATE)
+
+        # Store documents for hooks (only if hooks are registered)
+        before_hook_docs: List[Dict[str, Any]] = []
+        after_hook_docs: List[Dict[str, Any]] = []
+
+        # Convert updates to list to allow multiple iterations
+        updates = list(updates)
+
         # Define the function that will perform the update
         def perform_update(fields, table, doc_id):
             if callable(fields):
@@ -544,10 +695,30 @@ class Table:
                 # data
                 table[doc_id].update(fields)
 
+        # Pre-calculate which documents will be affected for before hooks
+        # (only if hooks are registered)
+        if has_hooks:
+            table_snapshot = self._read_table(include_deleted=True)
+            affected_doc_ids = set()
+            for str_doc_id, doc in table_snapshot.items():
+                for fields, cond in updates:
+                    _cond = cast(QueryLike, cond)
+                    if _cond(doc):
+                        doc_id = self.document_id_class(str_doc_id)
+                        if doc_id not in affected_doc_ids:
+                            affected_doc_ids.add(doc_id)
+                            before_hook_docs.append({
+                                'doc_id': doc_id,
+                                **dict(doc)
+                            })
+
+            # Run before-update hooks
+            self._run_hooks(HookEvent.BEFORE_UPDATE, before_hook_docs)
+
         # Perform the update operation for documents specified by a query
 
         # Collect affected doc_ids
-        updated_ids = []
+        updated_ids: List[int] = []
 
         def updater(table: dict):
             # We need to convert the keys iterator to a list because
@@ -568,8 +739,19 @@ class Table:
                         # Perform the update (see above)
                         perform_update(fields, table, doc_id)
 
+                        # Capture updated document for after hooks (only if needed)
+                        if has_hooks:
+                            after_hook_docs.append({
+                                'doc_id': doc_id,
+                                **dict(table[doc_id])
+                            })
+
         # Perform the update operation (see _update_table for details)
         self._update_table(updater)
+
+        # Run after-update hooks
+        if has_hooks:
+            self._run_hooks(HookEvent.AFTER_UPDATE, after_hook_docs)
 
         return updated_ids
 
@@ -626,6 +808,9 @@ class Table:
         :param doc_ids: a list of document IDs
         :returns: a list containing the removed documents' ID
         """
+        # Store documents for hooks
+        hook_docs: List[Dict[str, Any]] = []
+
         if doc_ids is not None:
             # This function returns the list of IDs for the documents that have
             # been removed. When removing documents identified by a set of
@@ -636,6 +821,19 @@ class Table:
             # to return the list of affected document IDs
             removed_ids = list(doc_ids)
 
+            # Prepare documents for hooks
+            table_snapshot = self._read_table(include_deleted=True)
+            for doc_id in removed_ids:
+                str_doc_id = str(doc_id)
+                if str_doc_id in table_snapshot:
+                    hook_docs.append({
+                        'doc_id': doc_id,
+                        **dict(table_snapshot[str_doc_id])
+                    })
+
+            # Run before-delete hooks
+            self._run_hooks(HookEvent.BEFORE_DELETE, hook_docs)
+
             def updater(table: dict):
                 for doc_id in removed_ids:
                     table.pop(doc_id)
@@ -643,10 +841,26 @@ class Table:
             # Perform the remove operation
             self._update_table(updater)
 
+            # Run after-delete hooks
+            self._run_hooks(HookEvent.AFTER_DELETE, hook_docs)
+
             return removed_ids
 
         if cond is not None:
-            removed_ids = []
+            removed_ids: List[int] = []
+
+            # Pre-calculate which documents will be removed for before hooks
+            table_snapshot = self._read_table(include_deleted=True)
+            _cond = cast(QueryLike, cond)
+            for str_doc_id, doc in table_snapshot.items():
+                if _cond(doc):
+                    hook_docs.append({
+                        'doc_id': self.document_id_class(str_doc_id),
+                        **dict(doc)
+                    })
+
+            # Run before-delete hooks
+            self._run_hooks(HookEvent.BEFORE_DELETE, hook_docs)
 
             # This updater function will be called with the table data
             # as its first argument. See ``Table._update`` for details on this
@@ -673,6 +887,9 @@ class Table:
             # Perform the remove operation
             self._update_table(updater)
 
+            # Run after-delete hooks
+            self._run_hooks(HookEvent.AFTER_DELETE, hook_docs)
+
             return removed_ids
 
         raise RuntimeError('Use truncate() to remove all documents')
@@ -681,9 +898,28 @@ class Table:
         """
         Truncate the table by removing all documents.
         """
+        # Check if hooks are registered to avoid unnecessary work
+        has_hooks = self._has_hooks(HookEvent.BEFORE_DELETE, HookEvent.AFTER_DELETE)
+
+        # Prepare documents for hooks (only if hooks are registered)
+        hook_docs: List[Dict[str, Any]] = []
+        if has_hooks:
+            table_snapshot = self._read_table(include_deleted=True)
+            for str_doc_id, doc in table_snapshot.items():
+                hook_docs.append({
+                    'doc_id': self.document_id_class(str_doc_id),
+                    **dict(doc)
+                })
+
+            # Run before-delete hooks
+            self._run_hooks(HookEvent.BEFORE_DELETE, hook_docs)
 
         # Update the table by resetting all data
         self._update_table(lambda table: table.clear())
+
+        # Run after-delete hooks
+        if has_hooks:
+            self._run_hooks(HookEvent.AFTER_DELETE, hook_docs)
 
         # Reset document ID counter
         self._next_id = None
@@ -705,8 +941,28 @@ class Table:
         Note: This method clears the query cache since soft-deleted
         documents are hidden from normal queries.
         """
+        # Check if hooks are registered to avoid unnecessary work
+        has_hooks = self._has_hooks(HookEvent.BEFORE_DELETE, HookEvent.AFTER_DELETE)
+
+        # Store documents for hooks (only if hooks are registered)
+        hook_docs: List[Dict[str, Any]] = []
+
         if doc_ids is not None:
             soft_deleted_ids = list(doc_ids)
+
+            # Prepare documents for hooks (only if hooks are registered)
+            if has_hooks:
+                table_snapshot = self._read_table(include_deleted=True)
+                for doc_id in soft_deleted_ids:
+                    str_doc_id = str(doc_id)
+                    if str_doc_id in table_snapshot:
+                        hook_docs.append({
+                            'doc_id': doc_id,
+                            **dict(table_snapshot[str_doc_id])
+                        })
+
+                # Run before-delete hooks
+                self._run_hooks(HookEvent.BEFORE_DELETE, hook_docs)
 
             def updater(table: dict):
                 for doc_id in soft_deleted_ids:
@@ -715,10 +971,31 @@ class Table:
 
             # _update_table clears the cache after modifying data
             self._update_table(updater)
+
+            # Run after-delete hooks
+            if has_hooks:
+                self._run_hooks(HookEvent.AFTER_DELETE, hook_docs)
+
             return soft_deleted_ids
 
         if cond is not None:
             soft_deleted_ids: List[int] = []
+
+            # Pre-calculate which documents will be affected for before hooks
+            # (only if hooks are registered)
+            if has_hooks:
+                table_snapshot = self._read_table(include_deleted=True)
+                _cond = cast(QueryLike, cond)
+                for str_doc_id, doc in table_snapshot.items():
+                    # Only include docs that match cond and are not already deleted
+                    if not doc.get(SOFT_DELETE_KEY, False) and _cond(doc):
+                        hook_docs.append({
+                            'doc_id': self.document_id_class(str_doc_id),
+                            **dict(doc)
+                        })
+
+                # Run before-delete hooks
+                self._run_hooks(HookEvent.BEFORE_DELETE, hook_docs)
 
             def updater(table: dict):
                 _cond = cast(QueryLike, cond)
@@ -732,6 +1009,11 @@ class Table:
 
             # _update_table clears the cache after modifying data
             self._update_table(updater)
+
+            # Run after-delete hooks
+            if has_hooks:
+                self._run_hooks(HookEvent.AFTER_DELETE, hook_docs)
+
             return soft_deleted_ids
 
         raise RuntimeError('You have to pass either cond or doc_ids')
@@ -755,12 +1037,38 @@ class Table:
 
         Note: This method clears the query cache since restoring documents
         changes which documents are visible in normal queries.
+
+        Note: Restore triggers INSERT hooks since documents are being
+        brought back into the visible dataset.
         """
+        # Check if hooks are registered to avoid unnecessary work
+        has_hooks = self._has_hooks(HookEvent.BEFORE_INSERT, HookEvent.AFTER_INSERT)
+
+        # Store documents for hooks (restore triggers INSERT hooks)
+        hook_docs: List[Dict[str, Any]] = []
+
         if doc_ids is not None:
             restored_ids: List[int] = []
+            doc_ids_list = list(doc_ids)
+
+            # Pre-calculate which documents will be restored for before hooks
+            # (only if hooks are registered)
+            if has_hooks:
+                table_snapshot = self._read_table(include_deleted=True)
+                for doc_id in doc_ids_list:
+                    str_doc_id = str(doc_id)
+                    if str_doc_id in table_snapshot:
+                        # Note: _read_table already strips _deleted key
+                        hook_docs.append({
+                            'doc_id': doc_id,
+                            **dict(table_snapshot[str_doc_id])
+                        })
+
+                # Run before-insert hooks (restore brings documents back)
+                self._run_hooks(HookEvent.BEFORE_INSERT, hook_docs)
 
             def updater(table: dict):
-                for doc_id in doc_ids:
+                for doc_id in doc_ids_list:
                     if doc_id in table and \
                             table[doc_id].get(SOFT_DELETE_KEY, False):
                         del table[doc_id][SOFT_DELETE_KEY]
@@ -768,10 +1076,31 @@ class Table:
 
             # _update_table clears the cache after modifying data
             self._update_table(updater)
+
+            # Run after-insert hooks
+            if has_hooks:
+                self._run_hooks(HookEvent.AFTER_INSERT, hook_docs)
+
             return restored_ids
 
         if cond is not None:
             restored_ids = []
+
+            # Pre-calculate which documents will be restored for before hooks
+            # (only if hooks are registered)
+            if has_hooks:
+                # Use deleted_only to get only soft-deleted documents
+                table_snapshot = self._read_table(deleted_only=True)
+                _cond = cast(QueryLike, cond)
+                for str_doc_id, doc in table_snapshot.items():
+                    if _cond(doc):
+                        hook_docs.append({
+                            'doc_id': self.document_id_class(str_doc_id),
+                            **dict(doc)
+                        })
+
+                # Run before-insert hooks
+                self._run_hooks(HookEvent.BEFORE_INSERT, hook_docs)
 
             def updater(table: dict):
                 _cond = cast(QueryLike, cond)
@@ -791,10 +1120,28 @@ class Table:
 
             # _update_table clears the cache after modifying data
             self._update_table(updater)
+
+            # Run after-insert hooks
+            if has_hooks:
+                self._run_hooks(HookEvent.AFTER_INSERT, hook_docs)
+
             return restored_ids
 
         # Restore all soft-deleted documents
         restored_ids = []
+
+        # Pre-calculate all soft-deleted documents for before hooks
+        # (only if hooks are registered)
+        if has_hooks:
+            table_snapshot = self._read_table(deleted_only=True)
+            for str_doc_id, doc in table_snapshot.items():
+                hook_docs.append({
+                    'doc_id': self.document_id_class(str_doc_id),
+                    **dict(doc)
+                })
+
+            # Run before-insert hooks
+            self._run_hooks(HookEvent.BEFORE_INSERT, hook_docs)
 
         def updater(table: dict):
             for doc_id in list(table.keys()):
@@ -805,6 +1152,11 @@ class Table:
 
         # _update_table clears the cache after modifying data
         self._update_table(updater)
+
+        # Run after-insert hooks
+        if has_hooks:
+            self._run_hooks(HookEvent.AFTER_INSERT, hook_docs)
+
         return restored_ids
 
     def deleted(
@@ -862,11 +1214,34 @@ class Table:
         Note: This method clears the query cache since purging documents
         removes them from the database entirely.
         """
+        # Check if hooks are registered to avoid unnecessary work
+        has_hooks = self._has_hooks(HookEvent.BEFORE_DELETE, HookEvent.AFTER_DELETE)
+
+        # Store documents for hooks (only if hooks are registered)
+        hook_docs: List[Dict[str, Any]] = []
+
         if doc_ids is not None:
             purged_ids: List[int] = []
+            doc_ids_list = list(doc_ids)
+
+            # Pre-calculate which documents will be purged for before hooks
+            # (only if hooks are registered)
+            if has_hooks:
+                # Use deleted_only to get only soft-deleted documents
+                table_snapshot = self._read_table(deleted_only=True)
+                for doc_id in doc_ids_list:
+                    str_doc_id = str(doc_id)
+                    if str_doc_id in table_snapshot:
+                        hook_docs.append({
+                            'doc_id': doc_id,
+                            **dict(table_snapshot[str_doc_id])
+                        })
+
+                # Run before-delete hooks
+                self._run_hooks(HookEvent.BEFORE_DELETE, hook_docs)
 
             def updater(table: dict):
-                for doc_id in doc_ids:
+                for doc_id in doc_ids_list:
                     # Only purge if the document is soft-deleted
                     if doc_id in table and \
                             table[doc_id].get(SOFT_DELETE_KEY, False):
@@ -875,10 +1250,30 @@ class Table:
 
             # _update_table clears the cache after modifying data
             self._update_table(updater)
+
+            # Run after-delete hooks
+            if has_hooks:
+                self._run_hooks(HookEvent.AFTER_DELETE, hook_docs)
+
             return purged_ids
 
         if cond is not None:
             purged_ids = []
+
+            # Pre-calculate which documents will be purged for before hooks
+            # (only if hooks are registered)
+            if has_hooks:
+                table_snapshot = self._read_table(deleted_only=True)
+                _cond = cast(QueryLike, cond)
+                for str_doc_id, doc in table_snapshot.items():
+                    if _cond(doc):
+                        hook_docs.append({
+                            'doc_id': self.document_id_class(str_doc_id),
+                            **dict(doc)
+                        })
+
+                # Run before-delete hooks
+                self._run_hooks(HookEvent.BEFORE_DELETE, hook_docs)
 
             def updater(table: dict):
                 _cond = cast(QueryLike, cond)
@@ -898,10 +1293,28 @@ class Table:
 
             # _update_table clears the cache after modifying data
             self._update_table(updater)
+
+            # Run after-delete hooks
+            if has_hooks:
+                self._run_hooks(HookEvent.AFTER_DELETE, hook_docs)
+
             return purged_ids
 
         # Purge all soft-deleted documents
         purged_ids = []
+
+        # Pre-calculate all soft-deleted documents for before hooks
+        # (only if hooks are registered)
+        if has_hooks:
+            table_snapshot = self._read_table(deleted_only=True)
+            for str_doc_id, doc in table_snapshot.items():
+                hook_docs.append({
+                    'doc_id': self.document_id_class(str_doc_id),
+                    **dict(doc)
+                })
+
+            # Run before-delete hooks
+            self._run_hooks(HookEvent.BEFORE_DELETE, hook_docs)
 
         def updater(table: dict):
             for doc_id in list(table.keys()):
@@ -912,6 +1325,11 @@ class Table:
 
         # _update_table clears the cache after modifying data
         self._update_table(updater)
+
+        # Run after-delete hooks
+        if has_hooks:
+            self._run_hooks(HookEvent.AFTER_DELETE, hook_docs)
+
         return purged_ids
 
     def count(self, cond: QueryLike, include_deleted: bool = False) -> int:
@@ -1103,6 +1521,38 @@ class Table:
         :returns: A new dict without the SOFT_DELETE_KEY
         """
         return {k: v for k, v in doc.items() if k != SOFT_DELETE_KEY}
+
+    def _has_hooks(self, *events: HookEvent) -> bool:
+        """
+        Check if any hooks are registered for the given events.
+
+        This can be used to skip expensive hook preparation (like reading
+        tables and building document lists) when no hooks are registered.
+
+        :param events: One or more hook events to check
+        :returns: True if at least one hook is registered for any event
+        """
+        if self._hooks is None:
+            return False
+        return any(self._hooks.has_hooks(event) for event in events)
+
+    def _run_hooks(
+        self,
+        event: HookEvent,
+        documents: List[Dict]
+    ) -> None:
+        """
+        Execute hooks for a given event if a hook manager is configured.
+
+        This method safely runs hooks without affecting database operations.
+        If no hook manager is configured or no hooks are registered for
+        the event, this method does nothing.
+
+        :param event: The hook event to trigger
+        :param documents: The affected documents with their doc_ids
+        """
+        if self._hooks is not None and self._hooks.has_hooks(event):
+            self._hooks.run(event, self._name, documents)
 
     def _update_table(self, updater: Callable[[Dict[int, Mapping]], None]):
         """

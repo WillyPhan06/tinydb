@@ -28,6 +28,16 @@ from .queries import Query, where
 from .storages import Storage, JSONStorage
 from .database import TinyDB
 from .table import SOFT_DELETE_KEY
+from .hooks import HookEvent, HookManager
 from .version import __version__
 
-__all__ = ('TinyDB', 'Storage', 'JSONStorage', 'Query', 'where', 'SOFT_DELETE_KEY')
+__all__ = (
+    'TinyDB',
+    'Storage',
+    'JSONStorage',
+    'Query',
+    'where',
+    'SOFT_DELETE_KEY',
+    'HookEvent',
+    'HookManager',
+)

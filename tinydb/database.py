@@ -7,6 +7,7 @@ from typing import Dict, Iterator, Set, Type
 from . import JSONStorage
 from .storages import Storage
 from .table import Table, Document
+from .hooks import HookEvent, HookManager
 from .utils import with_typehint
 
 # The table's base class. This is used to add type hinting from the Table
@@ -97,6 +98,9 @@ class TinyDB(TableBase):
         self._opened = True
         self._tables: Dict[str, Table] = {}
 
+        # Create the hook manager for database events
+        self._hooks = HookManager()
+
     def __repr__(self):
 
         args = [
@@ -127,7 +131,8 @@ class TinyDB(TableBase):
         if name in self._tables:
             return self._tables[name]
 
-        table = self.table_class(self.storage, name, **kwargs)
+        # Pass the hook manager to the table so it can trigger hooks
+        table = self.table_class(self.storage, name, hooks=self._hooks, **kwargs)
         self._tables[name] = table
 
         return table
@@ -210,6 +215,32 @@ class TinyDB(TableBase):
         :rtype: Storage
         """
         return self._storage
+
+    @property
+    def hooks(self) -> HookManager:
+        """
+        Get the hook manager for this TinyDB instance.
+
+        The hook manager allows registering callbacks for database events
+        such as insert, update, and delete operations.
+
+        Usage example:
+
+        >>> from tinydb import TinyDB
+        >>> from tinydb.hooks import HookEvent
+        >>>
+        >>> def on_insert(table_name, event, documents):
+        ...     print(f"Inserted into {table_name}: {documents}")
+        ...
+        >>> db = TinyDB('db.json')
+        >>> db.hooks.register(HookEvent.AFTER_INSERT, on_insert)
+        >>> db.insert({'name': 'Alice'})
+        Inserted into _default: [{'name': 'Alice', 'doc_id': 1}]
+
+        :return: This instance's hook manager
+        :rtype: HookManager
+        """
+        return self._hooks
 
     def close(self) -> None:
         """
