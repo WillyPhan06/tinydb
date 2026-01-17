@@ -21,6 +21,7 @@ from .queries import QueryLike
 from .storages import Storage
 from .utils import LRUCache
 from .hooks import HookEvent, HookManager
+from .validation import Schema, FieldValidator, ValidationError
 
 __all__ = ('Document', 'Table')
 
@@ -117,6 +118,7 @@ class Table:
         self._query_cache: LRUCache[QueryLike, List[Document]] \
             = self.query_cache_class(capacity=cache_size)
         self._hooks = hooks
+        self._schema: Optional[Schema] = None
 
         self._next_id = None
         if persist_empty:
@@ -145,6 +147,118 @@ class Table:
         """
         return self._storage
 
+    @property
+    def schema(self) -> Optional[Schema]:
+        """
+        Get the table's validation schema.
+
+        :returns: The Schema instance or None if no schema is set
+        """
+        return self._schema
+
+    def set_schema(self, schema: Optional[Schema]) -> None:
+        """
+        Set a validation schema for this table.
+
+        When a schema is set, all insert and update operations will
+        validate documents against the schema before writing to the
+        database.
+
+        :param schema: The Schema to use for validation, or None to
+                      disable validation
+
+        Example usage:
+
+        >>> from tinydb import TinyDB
+        >>> from tinydb.validation import Schema, FieldValidator
+        >>> db = TinyDB('db.json')
+        >>> table = db.table('users')
+        >>> table.set_schema(Schema({
+        ...     'name': FieldValidator(required=True, field_type=str),
+        ...     'age': FieldValidator(field_type=int),
+        ... }))
+        >>> table.insert({'name': 'John', 'age': 30})  # OK
+        >>> table.insert({'name': 123})  # Raises ValidationError
+        """
+        self._schema = schema
+
+    def add_validation(
+        self,
+        field_name: str,
+        required: bool = False,
+        field_type: Optional[Union[type, str]] = None,
+        validator: Optional[Callable[[Any], bool]] = None,
+        validator_message: Optional[str] = None
+    ) -> None:
+        """
+        Add a validation rule for a field.
+
+        This is a convenience method that creates or updates the table's
+        schema with a new field validator.
+
+        :param field_name: The name of the field to validate
+        :param required: If True, the field must be present and not None
+        :param field_type: The expected type of the field value
+        :param validator: Optional custom validation function
+        :param validator_message: Custom error message for the validator
+
+        Example usage:
+
+        >>> table.add_validation('name', required=True, field_type=str)
+        >>> table.add_validation('age', field_type=int)
+        >>> table.add_validation(
+        ...     'score',
+        ...     field_type=int,
+        ...     validator=lambda x: 0 <= x <= 100,
+        ...     validator_message="must be between 0 and 100"
+        ... )
+        """
+        if self._schema is None:
+            self._schema = Schema()
+
+        field_validator = FieldValidator(
+            required=required,
+            field_type=field_type,
+            validator=validator,
+            validator_message=validator_message
+        )
+        self._schema.add_field(field_name, field_validator)
+
+    def remove_validation(self, field_name: str) -> None:
+        """
+        Remove a validation rule for a field.
+
+        :param field_name: The name of the field to remove validation for
+        """
+        if self._schema is not None:
+            self._schema.remove_field(field_name)
+
+    def clear_validation(self) -> None:
+        """
+        Remove all validation rules from this table.
+        """
+        self._schema = None
+
+    def _validate_document(self, document: Mapping) -> None:
+        """
+        Validate a document against the table's schema.
+
+        :param document: The document to validate
+        :raises ValidationError: If validation fails
+        """
+        if self._schema is not None:
+            self._schema.validate(document)
+
+    def _validate_update_fields(self, fields: Mapping) -> None:
+        """
+        Validate fields being used to update a document.
+
+        :param fields: The fields being updated
+        :raises ValidationError: If validation fails
+        """
+        if self._schema is not None:
+            self._schema.validate_update(fields)
+
     def insert(self, document: Mapping) -> int:
         """
         Insert a new document into the table.
@@ -156,6 +270,9 @@ class Table:
         # Make sure the document implements the ``Mapping`` interface
         if not isinstance(document, Mapping):
             raise ValueError('Document is not a Mapping')
+
+        # Validate the document against the schema (if set)
+        self._validate_document(document)
 
         # First, we get the document ID for the new document
         if isinstance(document, self.document_class):
@@ -248,6 +365,13 @@ class Table:
         # Run before-insert hooks (we need to pre-process documents first)
         # Convert documents to list to allow iteration twice
         documents = list(documents)
+
+        # Validate all documents against the schema (if set)
+        # We do this before any database operations to fail fast
+        for document in documents:
+            if not isinstance(document, Mapping):
+                raise ValueError('Document is not a Mapping')
+            self._validate_document(document)
 
         # Pre-calculate doc_ids for before hooks
         before_hook_docs: List[Dict] = []
@@ -500,6 +624,12 @@ class Table:
         :returns: a list containing the updated document's ID
         """
 
+        # Validate update fields against the schema (if set and fields is a Mapping)
+        # For callable updates, validation is done after applying to a copy
+        is_callable_update = callable(fields)
+        if not is_callable_update and isinstance(fields, Mapping):
+            self._validate_update_fields(fields)
+
         # Check if hooks are registered to avoid unnecessary work
         has_hooks = self._has_hooks(HookEvent.BEFORE_UPDATE, HookEvent.AFTER_UPDATE)
 
@@ -507,15 +637,20 @@ class Table:
         before_hook_docs: List[Dict[str, Any]] = []
         after_hook_docs: List[Dict[str, Any]] = []
 
-        # Define the function that will perform the update
-        if callable(fields):
-            def perform_update(table, doc_id):
-                # Update documents by calling the update function provided by
-                # the user
-                fields(table[doc_id])
-        else:
-            def perform_update(table, doc_id):
-                # Update documents by setting all fields from the provided data
+        # For callable updates with schema validation, we need to validate
+        # the result of applying the callable to each document
+        def perform_update_with_validation(table, doc_id):
+            if is_callable_update:
+                # Apply callable to a copy, validate, then use the result
+                doc_copy = dict(table[doc_id])
+                fields(doc_copy)
+                if self._schema is not None:
+                    self._validate_document(doc_copy)
+                # Replace the actual document content with the validated copy
+                table[doc_id].clear()
+                table[doc_id].update(doc_copy)
+            else:
+                # For mapping updates, validation was already done above
                 table[doc_id].update(fields)
 
         if doc_ids is not None:
@@ -541,7 +676,7 @@ class Table:
             def updater(table: dict):
                 # Call the processing callback with all document IDs
                 for doc_id in updated_ids:
-                    perform_update(table, doc_id)
+                    perform_update_with_validation(table, doc_id)
                     # Capture updated document for after hooks (only if needed)
                     if has_hooks:
                         after_hook_docs.append({
@@ -587,7 +722,7 @@ class Table:
                         updated_ids.append(doc_id)
 
                         # Perform the update (see above)
-                        perform_update(table, doc_id)
+                        perform_update_with_validation(table, doc_id)
 
                         # Capture updated document for after hooks (only if needed)
                         if has_hooks:
@@ -644,7 +779,7 @@ class Table:
                     updated_ids.append(doc_id)
 
                     # Perform the update (see above)
-                    perform_update(table, doc_id)
+                    perform_update_with_validation(table, doc_id)
 
                     # Capture updated document for after hooks (only if needed)
                     if has_hooks:
@@ -684,15 +819,24 @@ class Table:
         # Convert updates to list to allow multiple iterations
         updates = list(updates)
 
-        # Define the function that will perform the update
-        def perform_update(fields, table, doc_id):
+        # Validate all update fields against the schema (if set)
+        for fields, _ in updates:
+            if not callable(fields) and isinstance(fields, Mapping):
+                self._validate_update_fields(fields)
+
+        # Define the function that will perform the update with validation
+        def perform_update_with_validation(fields, table, doc_id):
             if callable(fields):
-                # Update documents by calling the update function provided
-                # by the user
-                fields(table[doc_id])
+                # Apply callable to a copy, validate, then use the result
+                doc_copy = dict(table[doc_id])
+                fields(doc_copy)
+                if self._schema is not None:
+                    self._validate_document(doc_copy)
+                # Replace the actual document content with the validated copy
+                table[doc_id].clear()
+                table[doc_id].update(doc_copy)
             else:
-                # Update documents by setting all fields from the provided
-                # data
+                # For mapping updates, validation was already done above
                 table[doc_id].update(fields)
 
         # Pre-calculate which documents will be affected for before hooks
@@ -737,7 +881,7 @@ class Table:
                         updated_ids.append(doc_id)
 
                         # Perform the update (see above)
-                        perform_update(fields, table, doc_id)
+                        perform_update_with_validation(fields, table, doc_id)
 
                         # Capture updated document for after hooks (only if needed)
                         if has_hooks:

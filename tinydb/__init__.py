@@ -29,6 +29,7 @@ from .storages import Storage, JSONStorage
 from .database import TinyDB
 from .table import SOFT_DELETE_KEY
 from .hooks import HookEvent, HookManager
+from .validation import ValidationError, FieldValidator, Schema
 from .version import __version__
 
 __all__ = (
@@ -40,4 +41,7 @@ __all__ = (
     'SOFT_DELETE_KEY',
     'HookEvent',
     'HookManager',
+    'ValidationError',
+    'FieldValidator',
+    'Schema',
 )
