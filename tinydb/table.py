@@ -513,6 +513,78 @@ class Table:
         # Apply skip and limit to results
         return self._apply_pagination(docs, skip, limit)
 
+    def search_iter(
+        self,
+        cond: QueryLike,
+        limit: Optional[int] = None,
+        skip: int = 0,
+        include_deleted: bool = False
+    ) -> Iterator[Document]:
+        """
+        Search for all documents matching a 'where' cond, returning results
+        as an iterator for memory-efficient processing of large result sets.
+
+        Unlike :meth:`search` which returns a list, this method yields
+        documents one at a time, preventing memory issues when dealing
+        with large numbers of matching documents.
+
+        Note: This method does not use the query cache because caching
+        would require materializing all results into memory.
+
+        :param cond: the condition to check against
+        :param limit: maximum number of documents to return (default: no limit)
+        :param skip: number of documents to skip from the beginning
+                     (default: 0)
+        :param include_deleted: If True, include soft-deleted documents.
+                               Default is False.
+        :returns: iterator of matching documents
+
+        Example usage:
+
+        >>> # Process matching documents one at a time
+        >>> for doc in db.search_iter(where('type') == 'user'):
+        ...     process(doc)
+        >>> # Get first 10 matching documents as iterator
+        >>> for doc in db.search_iter(where('type') == 'user', limit=10):
+        ...     print(doc)
+        >>> # Skip first 20 and get next 10 matching documents
+        >>> results = list(db.search_iter(where('type') == 'user', limit=10, skip=20))
+        """
+        if skip < 0:
+            raise ValueError(
+                f'skip must be a non-negative integer, got {skip}'
+            )
+
+        if limit is not None and limit < 0:
+            raise ValueError(
+                f'limit must be a non-negative integer or None, got {limit}'
+            )
+
+        # Early return if limit is 0
+        if limit == 0:
+            return
+
+        skipped = 0
+        yielded = 0
+
+        for doc_id, doc in self._read_table(
+            include_deleted=include_deleted
+        ).items():
+            # Check if the document matches the condition
+            if cond(doc):
+                # Handle skip
+                if skipped < skip:
+                    skipped += 1
+                    continue
+
+                # Yield the document
+                yield self.document_class(doc, self.document_id_class(doc_id))
+                yielded += 1
+
+                # Check limit
+                if limit is not None and yielded >= limit:
+                    return
+
     def get(
         self,
         cond: Optional[QueryLike] = None,

@@ -419,3 +419,60 @@ def test_include_deleted_strips_deleted_field(db: TinyDB):
     assert len(docs) == 2
     for doc in docs:
         assert SOFT_DELETE_KEY not in doc
+
+
+def test_search_iter_excludes_soft_deleted(db: TinyDB):
+    """Test that search_iter excludes soft-deleted documents by default."""
+    db.soft_remove(where('char') == 'b')
+
+    # Normal search_iter excludes deleted
+    results = list(db.search_iter(where('int') == 1))
+    assert len(results) == 2
+    assert all(doc['char'] != 'b' for doc in results)
+
+
+def test_search_iter_include_deleted(db: TinyDB):
+    """Test that search_iter can include soft-deleted documents."""
+    db.soft_remove(where('char') == 'b')
+
+    # With include_deleted=True
+    results = list(db.search_iter(where('int') == 1, include_deleted=True))
+    assert len(results) == 3
+
+    # _deleted field should NOT be visible to users
+    for doc in results:
+        assert SOFT_DELETE_KEY not in doc
+
+
+def test_search_iter_include_deleted_with_pagination(db: TinyDB):
+    """Test search_iter with include_deleted and pagination."""
+    db.soft_remove(where('char') == 'b')
+
+    # With include_deleted=True and limit
+    results = list(db.search_iter(where('int') == 1, include_deleted=True, limit=2))
+    assert len(results) == 2
+
+    # With include_deleted=True and skip
+    results = list(db.search_iter(where('int') == 1, include_deleted=True, skip=1))
+    assert len(results) == 2
+
+    # With include_deleted=True and both limit and skip
+    results = list(db.search_iter(where('int') == 1, include_deleted=True, limit=1, skip=1))
+    assert len(results) == 1
+
+
+def test_search_iter_matches_search_with_soft_delete(db: TinyDB):
+    """Test that search_iter returns same results as search with soft delete."""
+    db.soft_remove(where('char') == 'b')
+
+    query = where('int') == 1
+
+    # Compare normal results
+    search_results = db.search(query)
+    iter_results = list(db.search_iter(query))
+    assert search_results == iter_results
+
+    # Compare with include_deleted
+    search_results = db.search(query, include_deleted=True)
+    iter_results = list(db.search_iter(query, include_deleted=True))
+    assert search_results == iter_results

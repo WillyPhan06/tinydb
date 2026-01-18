@@ -922,3 +922,446 @@ def test_all_negative_skip_raises_error():
 
     with pytest.raises(ValueError, match='skip must be a non-negative integer'):
         db.all(skip=-10)
+
+
+# =============================================================================
+# search_iter() Tests
+# =============================================================================
+# These tests verify the iterator-based search functionality which provides
+# memory-efficient processing of large result sets.
+
+
+class TestSearchIterBasic:
+    """Basic functionality tests for search_iter."""
+
+    def test_returns_iterator_not_list(self):
+        """Verify search_iter returns a generator/iterator, not a list."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(10))
+
+        result = db.search_iter(where('int').exists())
+
+        # Should be an iterator with __iter__ and __next__
+        assert hasattr(result, '__iter__')
+        assert hasattr(result, '__next__')
+        # Should NOT be a list
+        assert not isinstance(result, list)
+
+    def test_returns_document_instances(self):
+        """Verify each yielded item is a Document instance with correct data."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i, 'type': 'user'} for i in range(10))
+
+        for doc in db.search_iter(where('type') == 'user'):
+            assert isinstance(doc, Document)
+            assert 'int' in doc
+            assert doc['type'] == 'user'
+            assert hasattr(doc, 'doc_id')
+
+    def test_filters_documents_correctly(self):
+        """Verify only matching documents are yielded."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'value': i, 'even': i % 2 == 0} for i in range(20))
+
+        results = list(db.search_iter(where('even') == True))
+
+        assert len(results) == 10
+        assert all(doc['even'] is True for doc in results)
+
+    def test_works_on_table_level(self):
+        """Verify search_iter works correctly on table instances."""
+        db = TinyDB(storage=MemoryStorage)
+        table = db.table('test_table')
+        table.insert_multiple({'int': i} for i in range(10))
+
+        results = list(table.search_iter(where('int').exists()))
+        assert len(results) == 10
+        assert [doc['int'] for doc in results] == list(range(10))
+
+    def test_no_cache_population(self):
+        """Verify search_iter does not populate the query cache."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(10))
+
+        query = where('int').exists()
+        assert not db._query_cache
+
+        # Consume the entire iterator
+        list(db.search_iter(query))
+
+        # Cache should remain empty
+        assert not db._query_cache
+
+
+class TestSearchIterLazyEvaluation:
+    """Tests demonstrating the memory efficiency of search_iter through lazy evaluation."""
+
+    def test_early_termination_does_not_process_all_documents(self):
+        """
+        Demonstrate that stopping iteration early means we don't need to
+        materialize all matching documents into memory.
+
+        This is the key benefit of search_iter over search() - with a large
+        dataset, we can process just what we need without loading everything.
+        """
+        db = TinyDB(storage=MemoryStorage)
+        # Insert a large number of documents
+        total_docs = 10000
+        db.insert_multiple({'index': i, 'data': f'value_{i}'} for i in range(total_docs))
+
+        # Track how many documents we actually consume
+        consumed_count = 0
+        desired_count = 5
+
+        iterator = db.search_iter(where('index').exists())
+        for doc in iterator:
+            consumed_count += 1
+            if consumed_count >= desired_count:
+                break
+
+        # We only consumed the small amount we needed
+        assert consumed_count == desired_count
+
+    def test_limit_stops_iteration_early(self):
+        """
+        Verify that using limit parameter stops yielding after the limit,
+        demonstrating we don't need to process all matching documents.
+        """
+        db = TinyDB(storage=MemoryStorage)
+        total_docs = 5000
+        db.insert_multiple({'index': i} for i in range(total_docs))
+
+        # With limit, we should only get that many results
+        small_limit = 10
+        results = list(db.search_iter(where('index').exists(), limit=small_limit))
+
+        assert len(results) == small_limit
+        # Verify we got the first 10 documents (in insertion order)
+        for i, doc in enumerate(results):
+            assert doc['index'] == i
+
+    def test_iterator_can_be_partially_consumed(self):
+        """
+        Verify that an iterator can be partially consumed, stopped,
+        and the consumed portion is correct.
+        """
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'index': i} for i in range(1000))
+
+        iterator = db.search_iter(where('index').exists())
+
+        # Consume first 3 items
+        first_three = [next(iterator) for _ in range(3)]
+        assert len(first_three) == 3
+        assert [doc['index'] for doc in first_three] == [0, 1, 2]
+
+        # Consume next 2 items
+        next_two = [next(iterator) for _ in range(2)]
+        assert len(next_two) == 2
+        assert [doc['index'] for doc in next_two] == [3, 4]
+
+        # We've only consumed 5 total, iterator still has more
+        sixth = next(iterator)
+        assert sixth['index'] == 5
+
+
+class TestSearchIterPagination:
+    """Tests for skip and limit pagination parameters."""
+
+    def test_limit_basic(self):
+        """Test basic limit functionality with exact document verification."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(100))
+
+        results = list(db.search_iter(where('int').exists(), limit=10))
+
+        assert len(results) == 10
+        # Verify exact documents: should be first 10 documents (0-9)
+        assert [doc['int'] for doc in results] == list(range(10))
+        # Verify doc_ids are correct
+        assert [doc.doc_id for doc in results] == list(range(1, 11))
+
+    def test_limit_zero_returns_empty(self):
+        """Test that limit=0 returns no results."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(100))
+
+        results = list(db.search_iter(where('int').exists(), limit=0))
+
+        assert results == []
+        assert len(results) == 0
+
+    def test_limit_larger_than_results(self):
+        """Test limit larger than total matching documents returns all documents."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(10))
+
+        results = list(db.search_iter(where('int').exists(), limit=100))
+
+        assert len(results) == 10
+        # Verify all 10 documents are returned with correct values
+        assert [doc['int'] for doc in results] == list(range(10))
+        assert [doc.doc_id for doc in results] == list(range(1, 11))
+
+    def test_skip_basic(self):
+        """Test basic skip functionality with exact document verification."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(100))
+
+        results = list(db.search_iter(where('int').exists(), skip=90))
+
+        assert len(results) == 10
+        # Verify exact documents: should be documents 90-99
+        assert [doc['int'] for doc in results] == list(range(90, 100))
+        # Verify doc_ids are correct (doc_id starts at 1)
+        assert [doc.doc_id for doc in results] == list(range(91, 101))
+
+    def test_skip_zero_returns_all(self):
+        """Test that skip=0 returns all results with correct values."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(10))
+
+        results = list(db.search_iter(where('int').exists(), skip=0))
+
+        assert len(results) == 10
+        # Verify all documents returned with correct values
+        assert [doc['int'] for doc in results] == list(range(10))
+        assert [doc.doc_id for doc in results] == list(range(1, 11))
+
+    def test_combined_limit_and_skip(self):
+        """Test combined limit and skip parameters with exact document verification."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(100))
+
+        results = list(db.search_iter(where('int').exists(), limit=10, skip=20))
+
+        assert len(results) == 10
+        # Verify exact documents: should be documents 20-29
+        assert [doc['int'] for doc in results] == list(range(20, 30))
+        # Verify doc_ids are correct
+        assert [doc.doc_id for doc in results] == list(range(21, 31))
+
+    def test_skip_plus_limit_exceeds_results(self):
+        """Test when skip + limit exceeds total results returns remaining documents."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(10))
+
+        results = list(db.search_iter(where('int').exists(), limit=10, skip=8))
+
+        assert len(results) == 2
+        # Verify exact documents: should be documents 8 and 9
+        assert [doc['int'] for doc in results] == [8, 9]
+        assert [doc.doc_id for doc in results] == [9, 10]
+
+    def test_pagination_with_filtered_query(self):
+        """Test pagination with a query that only matches some documents."""
+        db = TinyDB(storage=MemoryStorage)
+        # Insert 50 documents, only even 'int' values will match
+        db.insert_multiple({'int': i, 'even': i % 2 == 0} for i in range(50))
+
+        # Query for even documents (25 total: 0, 2, 4, ..., 48)
+        results = list(db.search_iter(where('even') == True, limit=5, skip=10))
+
+        assert len(results) == 5
+        # Should get documents with int values: 20, 22, 24, 26, 28
+        # (skipping first 10 even numbers: 0,2,4,6,8,10,12,14,16,18)
+        assert [doc['int'] for doc in results] == [20, 22, 24, 26, 28]
+        assert all(doc['even'] is True for doc in results)
+
+
+class TestSearchIterEdgeCases:
+    """Edge case tests for search_iter."""
+
+    def test_skip_larger_than_total_documents(self):
+        """Test that skip larger than total documents returns empty iterator."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(10))
+
+        results = list(db.search_iter(where('int').exists(), skip=100))
+        assert results == []
+        assert len(results) == 0
+
+    def test_skip_equals_total_documents(self):
+        """Test that skip equal to total documents returns empty iterator."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(10))
+
+        results = list(db.search_iter(where('int').exists(), skip=10))
+        assert results == []
+        assert len(results) == 0
+
+    def test_skip_larger_than_matching_documents(self):
+        """Test skip larger than matching (not total) documents."""
+        db = TinyDB(storage=MemoryStorage)
+        # Insert 100 docs, but only 10 will match
+        db.insert_multiple({'int': i, 'match': i < 10} for i in range(100))
+
+        results = list(db.search_iter(where('match') == True, skip=20))
+        assert results == []
+        assert len(results) == 0
+
+    def test_skip_with_limit_beyond_results(self):
+        """Test skip + limit combination where skip exceeds results."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(10))
+
+        results = list(db.search_iter(where('int').exists(), limit=5, skip=15))
+        assert results == []
+        assert len(results) == 0
+
+    def test_empty_database(self):
+        """Test search_iter on empty database."""
+        db = TinyDB(storage=MemoryStorage)
+
+        results = list(db.search_iter(where('int').exists()))
+        assert results == []
+
+    def test_no_matching_documents(self):
+        """Test search_iter when no documents match the query."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(10))
+
+        results = list(db.search_iter(where('nonexistent').exists()))
+        assert results == []
+
+    def test_negative_limit_raises_error(self):
+        """Test that negative limit raises ValueError."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(5))
+
+        with pytest.raises(ValueError, match='limit must be a non-negative integer'):
+            list(db.search_iter(where('int').exists(), limit=-1))
+
+        with pytest.raises(ValueError, match='limit must be a non-negative integer'):
+            list(db.search_iter(where('int').exists(), limit=-10))
+
+    def test_negative_skip_raises_error(self):
+        """Test that negative skip raises ValueError."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(5))
+
+        with pytest.raises(ValueError, match='skip must be a non-negative integer'):
+            list(db.search_iter(where('int').exists(), skip=-1))
+
+        with pytest.raises(ValueError, match='skip must be a non-negative integer'):
+            list(db.search_iter(where('int').exists(), skip=-10))
+
+
+class TestSearchIterConsistencyWithSearch:
+    """Tests ensuring search_iter produces identical results to search."""
+
+    def test_basic_results_match(self):
+        """Verify basic results match between search and search_iter."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i, 'type': 'user' if i % 2 == 0 else 'admin'}
+                          for i in range(50))
+
+        query = where('type') == 'user'
+
+        search_results = db.search(query)
+        iter_results = list(db.search_iter(query))
+
+        assert search_results == iter_results
+
+    def test_pagination_consistency_multiple_pages(self):
+        """
+        Test that paginating through results with search_iter produces
+        the same results as search for multiple consecutive pages.
+        """
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'index': i, 'category': i % 3} for i in range(100))
+
+        query = where('category') == 0  # 34 matching documents (0, 3, 6, ..., 99)
+        page_size = 10
+
+        # Get all pages using both methods and compare
+        page = 0
+        while True:
+            skip = page * page_size
+            search_page = db.search(query, limit=page_size, skip=skip)
+            iter_page = list(db.search_iter(query, limit=page_size, skip=skip))
+
+            assert search_page == iter_page, f"Mismatch on page {page}"
+
+            if len(search_page) < page_size:
+                # Last page reached
+                break
+            page += 1
+
+        # Verify we actually tested multiple pages
+        assert page >= 3, "Should have tested at least 3 pages"
+
+    def test_various_limit_values_match(self):
+        """Test various limit values produce matching results."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(50))
+
+        query = where('int').exists()
+
+        for limit in [1, 5, 10, 25, 50, 100]:
+            search_results = db.search(query, limit=limit)
+            iter_results = list(db.search_iter(query, limit=limit))
+            assert search_results == iter_results, f"Mismatch for limit={limit}"
+
+    def test_various_skip_values_match(self):
+        """Test various skip values produce matching results."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(50))
+
+        query = where('int').exists()
+
+        for skip in [0, 1, 10, 25, 49, 50, 100]:
+            search_results = db.search(query, skip=skip)
+            iter_results = list(db.search_iter(query, skip=skip))
+            assert search_results == iter_results, f"Mismatch for skip={skip}"
+
+    def test_combined_pagination_values_match(self):
+        """Test various combinations of limit and skip produce matching results."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(100))
+
+        query = where('int').exists()
+
+        test_cases = [
+            (5, 0), (5, 10), (5, 95), (5, 100),
+            (10, 0), (10, 50), (10, 90), (10, 100),
+            (20, 0), (20, 40), (20, 80), (20, 100),
+            (1, 0), (1, 50), (1, 99), (1, 100),
+            (100, 0), (100, 50), (100, 100),
+        ]
+
+        for limit, skip in test_cases:
+            search_results = db.search(query, limit=limit, skip=skip)
+            iter_results = list(db.search_iter(query, limit=limit, skip=skip))
+            assert search_results == iter_results, \
+                f"Mismatch for limit={limit}, skip={skip}"
+
+    def test_document_order_preserved(self):
+        """Verify document order is preserved between search and search_iter."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'index': i} for i in range(100))
+
+        query = where('index').exists()
+
+        search_order = [doc['index'] for doc in db.search(query)]
+        iter_order = [doc['index'] for doc in db.search_iter(query)]
+
+        assert search_order == iter_order
+
+    def test_repeated_calls_produce_same_results(self):
+        """Verify multiple calls with same parameters produce identical results."""
+        db = TinyDB(storage=MemoryStorage)
+        db.insert_multiple({'int': i} for i in range(50))
+
+        query = where('int') >= 25
+
+        # Call search_iter multiple times with same parameters
+        results1 = list(db.search_iter(query, limit=10, skip=5))
+        results2 = list(db.search_iter(query, limit=10, skip=5))
+        results3 = list(db.search_iter(query, limit=10, skip=5))
+
+        assert results1 == results2 == results3
+
+        # Also verify against search
+        search_results = db.search(query, limit=10, skip=5)
+        assert results1 == search_results
