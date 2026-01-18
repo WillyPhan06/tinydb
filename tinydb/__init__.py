@@ -30,6 +30,7 @@ from .database import TinyDB
 from .table import SOFT_DELETE_KEY
 from .hooks import HookEvent, HookManager
 from .validation import ValidationError, FieldValidator, Schema
+from .importexport import export_csv, import_csv, export_jsonl, import_jsonl
 from .version import __version__
 
 __all__ = (
@@ -44,4 +45,8 @@ __all__ = (
     'ValidationError',
     'FieldValidator',
     'Schema',
+    'export_csv',
+    'import_csv',
+    'export_jsonl',
+    'import_jsonl',
 )

@@ -3,6 +3,7 @@ This module implements tables, the central place for accessing and manipulating
 data in TinyDB.
 """
 
+from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -1556,6 +1557,118 @@ class Table:
         for doc_id, doc in self._read_table().items():
             # Convert documents to the document class
             yield self.document_class(doc, self.document_id_class(doc_id))
+
+    def export_csv(
+        self,
+        file_path: Union[str, Path],
+        *,
+        include_deleted: bool = False,
+        encoding: str = 'utf-8',
+    ) -> int:
+        """
+        Export table data to a CSV file.
+
+        Document IDs are preserved as the '_id' column. Complex values
+        (dicts, lists) are serialized as JSON strings.
+
+        :param file_path: Path to the output CSV file
+        :param include_deleted: If True, include soft-deleted documents.
+                               Default is False.
+        :param encoding: File encoding (default: 'utf-8')
+        :returns: Number of documents exported
+
+        Example usage:
+
+        >>> db = TinyDB('db.json')
+        >>> table = db.table('users')
+        >>> count = table.export_csv('users_backup.csv')
+        >>> print(f"Exported {count} documents")
+        """
+        from .importexport import export_csv
+        return export_csv(self, file_path, include_deleted=include_deleted,
+                          encoding=encoding)
+
+    def import_csv(
+        self,
+        file_path: Union[str, Path],
+        *,
+        encoding: str = 'utf-8',
+    ) -> List[int]:
+        """
+        Import data from a CSV file into the table.
+
+        If the CSV has an '_id' column, document IDs are preserved.
+        Complex values (dicts, lists) stored as JSON strings are
+        automatically deserialized.
+
+        :param file_path: Path to the input CSV file
+        :param encoding: File encoding (default: 'utf-8')
+        :returns: List of imported document IDs
+
+        Example usage:
+
+        >>> db = TinyDB('db.json')
+        >>> table = db.table('users')
+        >>> doc_ids = table.import_csv('users_backup.csv')
+        >>> print(f"Imported {len(doc_ids)} documents")
+        """
+        from .importexport import import_csv
+        return import_csv(self, file_path, encoding=encoding)
+
+    def export_jsonl(
+        self,
+        file_path: Union[str, Path],
+        *,
+        include_deleted: bool = False,
+        encoding: str = 'utf-8',
+    ) -> int:
+        """
+        Export table data to a JSONL (JSON Lines) file.
+
+        Each document is written as a single JSON object per line.
+        Document IDs are preserved as the '_id' field.
+
+        :param file_path: Path to the output JSONL file
+        :param include_deleted: If True, include soft-deleted documents.
+                               Default is False.
+        :param encoding: File encoding (default: 'utf-8')
+        :returns: Number of documents exported
+
+        Example usage:
+
+        >>> db = TinyDB('db.json')
+        >>> table = db.table('users')
+        >>> count = table.export_jsonl('users_backup.jsonl')
+        >>> print(f"Exported {count} documents")
+        """
+        from .importexport import export_jsonl
+        return export_jsonl(self, file_path, include_deleted=include_deleted,
+                            encoding=encoding)
+
+    def import_jsonl(
+        self,
+        file_path: Union[str, Path],
+        *,
+        encoding: str = 'utf-8',
+    ) -> List[int]:
+        """
+        Import data from a JSONL (JSON Lines) file into the table.
+
+        If documents have an '_id' field, document IDs are preserved.
+
+        :param file_path: Path to the input JSONL file
+        :param encoding: File encoding (default: 'utf-8')
+        :returns: List of imported document IDs
+
+        Example usage:
+
+        >>> db = TinyDB('db.json')
+        >>> table = db.table('users')
+        >>> doc_ids = table.import_jsonl('users_backup.jsonl')
+        >>> print(f"Imported {len(doc_ids)} documents")
+        """
+        from .importexport import import_jsonl
+        return import_jsonl(self, file_path, encoding=encoding)
 
     def _get_next_id(self):
         """
