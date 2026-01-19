@@ -32,6 +32,7 @@ from .hooks import HookEvent, HookManager
 from .validation import ValidationError, FieldValidator, Schema
 from .importexport import export_csv, import_csv, export_jsonl, import_jsonl
 from .profiling import QueryProfiler, QueryStats, QuerySummary
+from .transactions import Transaction, TransactionError
 from .version import __version__
 
 __all__ = (
@@ -53,4 +54,6 @@ __all__ = (
     'QueryProfiler',
     'QueryStats',
     'QuerySummary',
+    'Transaction',
+    'TransactionError',
 )

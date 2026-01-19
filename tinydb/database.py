@@ -8,6 +8,7 @@ from . import JSONStorage
 from .storages import Storage
 from .table import Table, Document
 from .hooks import HookEvent, HookManager
+from .transactions import Transaction
 from .utils import with_typehint
 
 # Import TYPE_CHECKING to avoid circular imports
@@ -340,6 +341,58 @@ class TinyDB(TableBase):
         # Update existing tables to remove the profiler
         for table in self._tables.values():
             table.set_profiler(None)
+
+    def transaction(self) -> Transaction:
+        """
+        Create a new transaction for atomic database operations.
+
+        Transactions allow multiple database operations to be executed
+        atomically - either all operations succeed, or all fail together
+        with automatic rollback. This is essential for maintaining data
+        consistency when performing related operations.
+
+        Usage as a context manager (recommended):
+
+        >>> from tinydb import TinyDB, where
+        >>> db = TinyDB('db.json')
+        >>> accounts = db.table('accounts')
+        >>>
+        >>> # Transfer $100 from account 1 to account 2
+        >>> with db.transaction() as txn:
+        ...     txn.update(accounts, {'balance': lambda d: d['balance'] - 100},
+        ...                where('id') == 1)
+        ...     txn.update(accounts, {'balance': lambda d: d['balance'] + 100},
+        ...                where('id') == 2)
+        ...     txn.commit()
+
+        Manual usage:
+
+        >>> txn = db.transaction()
+        >>> try:
+        ...     txn.insert(users, {'name': 'Alice'})
+        ...     txn.insert(users, {'name': 'Bob'})
+        ...     txn.commit()
+        ... except Exception:
+        ...     txn.rollback()
+
+        Supported operations within a transaction:
+        - insert: Add new documents
+        - update: Modify existing documents
+        - remove: Hard delete documents
+        - soft_remove: Mark documents as deleted
+        - restore: Restore soft-deleted documents
+        - purge: Permanently remove soft-deleted documents
+
+        Transaction behavior:
+        - All operations are validated before any writes occur
+        - If validation fails, no changes are made
+        - If execution fails, all changes are rolled back
+        - Hooks are triggered after successful commit
+        - Exiting the context manager without commit() triggers rollback
+
+        :returns: A new Transaction instance
+        """
+        return Transaction(self)
 
     def close(self) -> None:
         """
