@@ -2,13 +2,18 @@
 This module contains the main component of TinyDB: the database.
 """
 
-from typing import Dict, Iterator, Set, Type
+from typing import Dict, Iterator, Optional, Set, Type
 
 from . import JSONStorage
 from .storages import Storage
 from .table import Table, Document
 from .hooks import HookEvent, HookManager
 from .utils import with_typehint
+
+# Import TYPE_CHECKING to avoid circular imports
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .profiling import QueryProfiler
 
 # The table's base class. This is used to add type hinting from the Table
 # class to TinyDB. Currently, this supports PyCharm, Pyright/VS Code and MyPy.
@@ -101,6 +106,9 @@ class TinyDB(TableBase):
         # Create the hook manager for database events
         self._hooks = HookManager()
 
+        # Query profiler (disabled by default)
+        self._profiler: Optional['QueryProfiler'] = None
+
     def __repr__(self):
 
         args = [
@@ -131,8 +139,14 @@ class TinyDB(TableBase):
         if name in self._tables:
             return self._tables[name]
 
-        # Pass the hook manager to the table so it can trigger hooks
-        table = self.table_class(self.storage, name, hooks=self._hooks, **kwargs)
+        # Pass the hook manager and profiler to the table
+        table = self.table_class(
+            self.storage,
+            name,
+            hooks=self._hooks,
+            profiler=self._profiler,
+            **kwargs
+        )
         self._tables[name] = table
 
         return table
@@ -241,6 +255,91 @@ class TinyDB(TableBase):
         :rtype: HookManager
         """
         return self._hooks
+
+    @property
+    def profiler(self) -> Optional['QueryProfiler']:
+        """
+        Get the query profiler for this TinyDB instance.
+
+        :return: The QueryProfiler instance or None if profiling is disabled
+        """
+        return self._profiler
+
+    def enable_profiling(
+        self,
+        profiler: Optional['QueryProfiler'] = None
+    ) -> 'QueryProfiler':
+        """
+        Enable query profiling for this database.
+
+        When profiling is enabled, all query operations (search, get, count,
+        etc.) will record their execution time and statistics. This helps
+        identify slow queries and optimization opportunities.
+
+        :param profiler: Optional QueryProfiler instance to use. If not
+                        provided, a new one will be created.
+        :return: The QueryProfiler instance being used
+
+        Usage example:
+
+        >>> from tinydb import TinyDB, where
+        >>> from tinydb.profiling import QueryProfiler
+        >>>
+        >>> db = TinyDB('db.json')
+        >>>
+        >>> # Option 1: Let TinyDB create a profiler
+        >>> profiler = db.enable_profiling()
+        >>>
+        >>> # Option 2: Use your own profiler
+        >>> my_profiler = QueryProfiler()
+        >>> db.enable_profiling(my_profiler)
+        >>>
+        >>> # Perform queries
+        >>> db.search(where('name') == 'John')
+        >>> db.search(where('age') > 25)
+        >>>
+        >>> # View statistics
+        >>> print(profiler.get_summary())
+        >>>
+        >>> # Get slowest queries
+        >>> for stats in profiler.get_slowest_queries(5):
+        ...     print(f"[{stats.table_name}] {stats.query_repr}: {stats.avg_time_ms:.2f}ms")
+        """
+        # Import here to avoid circular imports
+        from .profiling import QueryProfiler as QP
+
+        if profiler is None:
+            profiler = QP()
+
+        self._profiler = profiler
+
+        # Update existing tables with the profiler
+        for table in self._tables.values():
+            table.set_profiler(profiler)
+
+        return profiler
+
+    def disable_profiling(self) -> None:
+        """
+        Disable query profiling for this database.
+
+        This stops recording query statistics. Previously recorded statistics
+        are preserved in the profiler instance (if you kept a reference to it).
+
+        Usage example:
+
+        >>> db = TinyDB('db.json')
+        >>> profiler = db.enable_profiling()
+        >>> # ... perform queries ...
+        >>> db.disable_profiling()
+        >>> # Profiler still has the recorded data
+        >>> print(profiler.get_summary())
+        """
+        self._profiler = None
+
+        # Update existing tables to remove the profiler
+        for table in self._tables.values():
+            table.set_profiler(None)
 
     def close(self) -> None:
         """

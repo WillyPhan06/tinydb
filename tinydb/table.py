@@ -18,11 +18,17 @@ from typing import (
     Tuple
 )
 
+import time
 from .queries import QueryLike
 from .storages import Storage
 from .utils import LRUCache
 from .hooks import HookEvent, HookManager
 from .validation import Schema, FieldValidator, ValidationError
+
+# Import TYPE_CHECKING to avoid circular imports
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .profiling import QueryProfiler
 
 __all__ = ('Document', 'Table')
 
@@ -108,7 +114,8 @@ class Table:
         name: str,
         cache_size: int = default_query_cache_capacity,
         persist_empty: bool = False,
-        hooks: Optional[HookManager] = None
+        hooks: Optional[HookManager] = None,
+        profiler: Optional['QueryProfiler'] = None
     ):
         """
         Create a table instance.
@@ -120,6 +127,7 @@ class Table:
             = self.query_cache_class(capacity=cache_size)
         self._hooks = hooks
         self._schema: Optional[Schema] = None
+        self._profiler: Optional['QueryProfiler'] = profiler
 
         self._next_id = None
         if persist_empty:
@@ -156,6 +164,26 @@ class Table:
         :returns: The Schema instance or None if no schema is set
         """
         return self._schema
+
+    @property
+    def profiler(self) -> Optional['QueryProfiler']:
+        """
+        Get the table's query profiler.
+
+        :returns: The QueryProfiler instance or None if profiling is not enabled
+        """
+        return self._profiler
+
+    def set_profiler(self, profiler: Optional['QueryProfiler']) -> None:
+        """
+        Set the query profiler for this table.
+
+        When a profiler is set, all query operations (search, get, count, etc.)
+        will record their execution time and statistics to the profiler.
+
+        :param profiler: The QueryProfiler instance or None to disable profiling
+        """
+        self._profiler = profiler
 
     def set_schema(self, schema: Optional[Schema]) -> None:
         """
@@ -478,16 +506,32 @@ class Table:
                 docs = cached_results[:]
                 return self._apply_pagination(docs, skip, limit)
 
+        # Start timing for profiling
+        start_time = time.perf_counter() if self._profiler else None
+
+        # Read the table data
+        table_data = self._read_table(include_deleted=include_deleted)
+        docs_scanned = len(table_data)
+
         # Perform the search by applying the query to all documents.
         # Then, only if the document matches the query, convert it
         # to the document class and document ID class.
         docs = [
             self.document_class(doc, self.document_id_class(doc_id))
-            for doc_id, doc in self._read_table(
-                include_deleted=include_deleted
-            ).items()
+            for doc_id, doc in table_data.items()
             if cond(doc)
         ]
+
+        # Record profiling data
+        if self._profiler and start_time is not None:
+            execution_time_ms = (time.perf_counter() - start_time) * 1000
+            self._profiler.record_query(
+                table_name=self._name,
+                query=cond,
+                execution_time_ms=execution_time_ms,
+                docs_scanned=docs_scanned,
+                docs_matched=len(docs)
+            )
 
         # Only cache cacheable queries when not including deleted documents
         if not include_deleted:
@@ -531,6 +575,15 @@ class Table:
         Note: This method does not use the query cache because caching
         would require materializing all results into memory.
 
+        .. note:: Profiling behavior
+
+            When profiling is enabled, the ``docs_matched`` count in the
+            profiler statistics represents only the number of documents
+            that were actually yielded (i.e., after applying skip and limit),
+            not the total number of documents matching the query condition.
+            This is because the iterator may not traverse all matching
+            documents if a limit is applied or iteration is stopped early.
+
         :param cond: the condition to check against
         :param limit: maximum number of documents to return (default: no limit)
         :param skip: number of documents to skip from the beginning
@@ -562,14 +615,28 @@ class Table:
 
         # Early return if limit is 0
         if limit == 0:
+            # Record query with 0 documents matched for consistency
+            if self._profiler:
+                table_data = self._read_table(include_deleted=include_deleted)
+                self._profiler.record_query(
+                    table_name=self._name,
+                    query=cond,
+                    execution_time_ms=0.0,
+                    docs_scanned=len(table_data),
+                    docs_matched=0
+                )
             return
+
+        # Start timing for profiling
+        start_time = time.perf_counter() if self._profiler else None
 
         skipped = 0
         yielded = 0
 
-        for doc_id, doc in self._read_table(
-            include_deleted=include_deleted
-        ).items():
+        table_data = self._read_table(include_deleted=include_deleted)
+        docs_scanned = len(table_data)
+
+        for doc_id, doc in table_data.items():
             # Check if the document matches the condition
             if cond(doc):
                 # Handle skip
@@ -583,7 +650,28 @@ class Table:
 
                 # Check limit
                 if limit is not None and yielded >= limit:
+                    # Record profiling data before returning
+                    if self._profiler and start_time is not None:
+                        execution_time_ms = (time.perf_counter() - start_time) * 1000
+                        self._profiler.record_query(
+                            table_name=self._name,
+                            query=cond,
+                            execution_time_ms=execution_time_ms,
+                            docs_scanned=docs_scanned,
+                            docs_matched=yielded
+                        )
                     return
+
+        # Record profiling data after iteration completes
+        if self._profiler and start_time is not None:
+            execution_time_ms = (time.perf_counter() - start_time) * 1000
+            self._profiler.record_query(
+                table_name=self._name,
+                query=cond,
+                execution_time_ms=execution_time_ms,
+                docs_scanned=docs_scanned,
+                docs_matched=yielded
+            )
 
     def get(
         self,
@@ -636,18 +724,43 @@ class Table:
 
         elif cond is not None:
             # Find a document specified by a query
+            # Start timing for profiling
+            start_time = time.perf_counter() if self._profiler else None
+
             # The trailing underscore in doc_id_ is needed so MyPy
             # doesn't think that `doc_id_` (which is a string) needs
             # to have the same type as `doc_id` which is this function's
             # parameter and is an optional `int`.
-            for doc_id_, doc in self._read_table(
-                include_deleted=include_deleted
-            ).items():
+            table_data = self._read_table(include_deleted=include_deleted)
+            docs_scanned = len(table_data)
+
+            for doc_id_, doc in table_data.items():
                 if cond(doc):
+                    # Record profiling data
+                    if self._profiler and start_time is not None:
+                        execution_time_ms = (time.perf_counter() - start_time) * 1000
+                        self._profiler.record_query(
+                            table_name=self._name,
+                            query=cond,
+                            execution_time_ms=execution_time_ms,
+                            docs_scanned=docs_scanned,
+                            docs_matched=1
+                        )
                     return self.document_class(
                         doc,
                         self.document_id_class(doc_id_)
                     )
+
+            # Record profiling data (no match found)
+            if self._profiler and start_time is not None:
+                execution_time_ms = (time.perf_counter() - start_time) * 1000
+                self._profiler.record_query(
+                    table_name=self._name,
+                    query=cond,
+                    execution_time_ms=execution_time_ms,
+                    docs_scanned=docs_scanned,
+                    docs_matched=0
+                )
 
             return None
 
