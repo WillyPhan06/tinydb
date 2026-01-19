@@ -35,6 +35,18 @@ __all__ = ('Document', 'Table')
 #: The key used to mark documents as soft-deleted
 SOFT_DELETE_KEY = '_deleted'
 
+#: The key used to store document creation timestamp
+CREATED_AT_KEY = '_created_at'
+
+#: The key used to store document last update timestamp
+UPDATED_AT_KEY = '_updated_at'
+
+#: The key used to store document soft-deletion timestamp
+DELETED_AT_KEY = '_deleted_at'
+
+#: All internal metadata keys that should be stripped from normal queries
+METADATA_KEYS = frozenset({SOFT_DELETE_KEY, CREATED_AT_KEY, UPDATED_AT_KEY, DELETED_AT_KEY})
+
 
 class Document(dict):
     """
@@ -333,7 +345,10 @@ class Table:
             # By calling ``dict(document)`` we convert the data we got to a
             # ``dict`` instance even if it was a different class that
             # implemented the ``Mapping`` interface
-            table[doc_id] = dict(document)
+            doc_data = dict(document)
+            # Add creation timestamp
+            doc_data[CREATED_AT_KEY] = time.time()
+            table[doc_id] = doc_data
 
         # See below for details on ``Table._update``
         self._update_table(updater)
@@ -379,6 +394,8 @@ class Table:
                     doc_ids.append(doc_id)
                     doc_copy = dict(document)
                     hook_docs.append({'doc_id': doc_id, **doc_copy})
+                    # Add creation timestamp
+                    doc_copy[CREATED_AT_KEY] = time.time()
                     table[doc_id] = doc_copy
                     continue
 
@@ -389,6 +406,8 @@ class Table:
                 doc_ids.append(doc_id)
                 doc_copy = dict(document)
                 hook_docs.append({'doc_id': doc_id, **doc_copy})
+                # Add creation timestamp
+                doc_copy[CREATED_AT_KEY] = time.time()
                 table[doc_id] = doc_copy
 
         # Run before-insert hooks (we need to pre-process documents first)
@@ -436,7 +455,8 @@ class Table:
         self,
         limit: Optional[int] = None,
         skip: int = 0,
-        include_deleted: bool = False
+        include_deleted: bool = False,
+        include_metadata: bool = False
     ) -> List[Document]:
         """
         Get all documents stored in the table.
@@ -446,6 +466,11 @@ class Table:
                      (default: 0)
         :param include_deleted: If True, include soft-deleted documents.
                                Default is False.
+        :param include_metadata: If True, include timestamp metadata fields
+                                (_created_at, _updated_at, _deleted_at) in
+                                the returned documents. This is useful for
+                                developers to track document changes for
+                                syncing or backup purposes. Default is False.
         :returns: a list with all documents.
 
         Example usage:
@@ -456,13 +481,16 @@ class Table:
         >>> db.all(limit=10, skip=20)
         >>> # Skip first 5 documents
         >>> db.all(skip=5)
+        >>> # Get all documents with metadata for syncing
+        >>> db.all(include_metadata=True)
         """
 
         # Get documents from the table, optionally including deleted ones
         docs = [
             self.document_class(doc, self.document_id_class(doc_id))
             for doc_id, doc in self._read_table(
-                include_deleted=include_deleted
+                include_deleted=include_deleted,
+                include_metadata=include_metadata
             ).items()
         ]
         return self._apply_pagination(docs, skip, limit)
@@ -472,7 +500,8 @@ class Table:
         cond: QueryLike,
         limit: Optional[int] = None,
         skip: int = 0,
-        include_deleted: bool = False
+        include_deleted: bool = False,
+        include_metadata: bool = False
     ) -> List[Document]:
         """
         Search for all documents matching a 'where' cond.
@@ -483,6 +512,11 @@ class Table:
                      (default: 0)
         :param include_deleted: If True, include soft-deleted documents.
                                Default is False.
+        :param include_metadata: If True, include timestamp metadata fields
+                                (_created_at, _updated_at, _deleted_at) in
+                                the returned documents. This is useful for
+                                developers to track document changes for
+                                syncing or backup purposes. Default is False.
         :returns: list of matching documents
 
         Example usage:
@@ -493,11 +527,14 @@ class Table:
         >>> db.search(where('type') == 'user', limit=10, skip=20)
         >>> # Skip first 5 matching documents
         >>> db.search(where('type') == 'user', skip=5)
+        >>> # Get documents with metadata for syncing
+        >>> db.search(where('type') == 'user', include_metadata=True)
         """
 
-        # Note: We don't use the query cache when include_deleted is True
-        # because the cache only stores results for non-deleted documents
-        if not include_deleted:
+        # Note: We don't use the query cache when include_deleted or
+        # include_metadata is True because the cache only stores results
+        # for non-deleted documents without metadata
+        if not include_deleted and not include_metadata:
             # First, we check the query cache to see if it has results for
             # this query
             cached_results = self._query_cache.get(cond)
@@ -510,7 +547,10 @@ class Table:
         start_time = time.perf_counter() if self._profiler else None
 
         # Read the table data
-        table_data = self._read_table(include_deleted=include_deleted)
+        table_data = self._read_table(
+            include_deleted=include_deleted,
+            include_metadata=include_metadata
+        )
         docs_scanned = len(table_data)
 
         # Perform the search by applying the query to all documents.
@@ -534,7 +574,8 @@ class Table:
             )
 
         # Only cache cacheable queries when not including deleted documents
-        if not include_deleted:
+        # or metadata
+        if not include_deleted and not include_metadata:
             # Only cache cacheable queries.
             #
             # This weird `getattr` dance is needed to make MyPy happy as
@@ -562,7 +603,8 @@ class Table:
         cond: QueryLike,
         limit: Optional[int] = None,
         skip: int = 0,
-        include_deleted: bool = False
+        include_deleted: bool = False,
+        include_metadata: bool = False
     ) -> Iterator[Document]:
         """
         Search for all documents matching a 'where' cond, returning results
@@ -590,6 +632,11 @@ class Table:
                      (default: 0)
         :param include_deleted: If True, include soft-deleted documents.
                                Default is False.
+        :param include_metadata: If True, include timestamp metadata fields
+                                (_created_at, _updated_at, _deleted_at) in
+                                the returned documents. This is useful for
+                                developers to track document changes for
+                                syncing or backup purposes. Default is False.
         :returns: iterator of matching documents
 
         Example usage:
@@ -617,7 +664,10 @@ class Table:
         if limit == 0:
             # Record query with 0 documents matched for consistency
             if self._profiler:
-                table_data = self._read_table(include_deleted=include_deleted)
+                table_data = self._read_table(
+                    include_deleted=include_deleted,
+                    include_metadata=include_metadata
+                )
                 self._profiler.record_query(
                     table_name=self._name,
                     query=cond,
@@ -633,7 +683,10 @@ class Table:
         skipped = 0
         yielded = 0
 
-        table_data = self._read_table(include_deleted=include_deleted)
+        table_data = self._read_table(
+            include_deleted=include_deleted,
+            include_metadata=include_metadata
+        )
         docs_scanned = len(table_data)
 
         for doc_id, doc in table_data.items():
@@ -678,7 +731,8 @@ class Table:
         cond: Optional[QueryLike] = None,
         doc_id: Optional[int] = None,
         doc_ids: Optional[List] = None,
-        include_deleted: bool = False
+        include_deleted: bool = False,
+        include_metadata: bool = False
     ) -> Optional[Union[Document, List[Document]]]:
         """
         Get exactly one document specified by a query or a document ID.
@@ -692,10 +746,18 @@ class Table:
         :param doc_ids: the document's IDs(multiple)
         :param include_deleted: If True, include soft-deleted documents.
                                Default is False.
+        :param include_metadata: If True, include timestamp metadata fields
+                                (_created_at, _updated_at, _deleted_at) in
+                                the returned documents. This is useful for
+                                developers to track document changes for
+                                syncing or backup purposes. Default is False.
 
         :returns: the document(s) or ``None``
         """
-        table = self._read_table(include_deleted=include_deleted)
+        table = self._read_table(
+            include_deleted=include_deleted,
+            include_metadata=include_metadata
+        )
 
         if doc_id is not None:
             # Retrieve a document specified by its ID
@@ -731,7 +793,10 @@ class Table:
             # doesn't think that `doc_id_` (which is a string) needs
             # to have the same type as `doc_id` which is this function's
             # parameter and is an optional `int`.
-            table_data = self._read_table(include_deleted=include_deleted)
+            table_data = self._read_table(
+                include_deleted=include_deleted,
+                include_metadata=include_metadata
+            )
             docs_scanned = len(table_data)
 
             for doc_id_, doc in table_data.items():
@@ -838,6 +903,8 @@ class Table:
             else:
                 # For mapping updates, validation was already done above
                 table[doc_id].update(fields)
+            # Add update timestamp
+            table[doc_id][UPDATED_AT_KEY] = time.time()
 
         if doc_ids is not None:
             # Perform the update operation for documents specified by a list
@@ -1024,6 +1091,8 @@ class Table:
             else:
                 # For mapping updates, validation was already done above
                 table[doc_id].update(fields)
+            # Add update timestamp
+            table[doc_id][UPDATED_AT_KEY] = time.time()
 
         # Pre-calculate which documents will be affected for before hooks
         # (only if hooks are registered)
@@ -1295,9 +1364,11 @@ class Table:
                 self._run_hooks(HookEvent.BEFORE_DELETE, hook_docs)
 
             def updater(table: dict):
+                delete_time = time.time()
                 for doc_id in soft_deleted_ids:
                     if doc_id in table:
                         table[doc_id][SOFT_DELETE_KEY] = True
+                        table[doc_id][DELETED_AT_KEY] = delete_time
 
             # _update_table clears the cache after modifying data
             self._update_table(updater)
@@ -1329,6 +1400,7 @@ class Table:
 
             def updater(table: dict):
                 _cond = cast(QueryLike, cond)
+                delete_time = time.time()
 
                 for doc_id in list(table.keys()):
                     doc = table[doc_id]
@@ -1336,6 +1408,7 @@ class Table:
                     if not doc.get(SOFT_DELETE_KEY, False) and _cond(doc):
                         soft_deleted_ids.append(doc_id)
                         table[doc_id][SOFT_DELETE_KEY] = True
+                        table[doc_id][DELETED_AT_KEY] = delete_time
 
             # _update_table clears the cache after modifying data
             self._update_table(updater)
@@ -1370,6 +1443,35 @@ class Table:
 
         Note: Restore triggers INSERT hooks since documents are being
         brought back into the visible dataset.
+
+        .. warning:: Timestamp metadata behavior
+
+            When a document is restored, only the internal ``_deleted`` flag
+            is removed. The ``_deleted_at`` timestamp is **preserved** in the
+            document's metadata as a historical record of when the document
+            was last soft-deleted.
+
+            This means:
+
+            - A restored document will still have ``_deleted_at`` visible
+              when using ``include_metadata=True``
+            - To determine if a document is currently soft-deleted, you must
+              check for the presence of ``_deleted`` (internal) or use normal
+              queries which automatically exclude soft-deleted documents
+            - Do NOT rely solely on ``_deleted_at`` to determine deletion
+              status, as it only indicates *when* the document was last
+              soft-deleted, not *whether* it is currently deleted
+
+            Example::
+
+                >>> db.insert({'name': 'test'})
+                >>> db.soft_remove(doc_ids=[1])  # Sets _deleted and _deleted_at
+                >>> db.restore(doc_ids=[1])       # Removes _deleted, keeps _deleted_at
+                >>> doc = db.get(doc_id=1, include_metadata=True)
+                >>> '_deleted_at' in doc  # True - historical timestamp preserved
+                True
+                >>> len(db) == 1  # Document is visible (not deleted)
+                True
         """
         # Check if hooks are registered to avoid unnecessary work
         has_hooks = self._has_hooks(HookEvent.BEFORE_INSERT, HookEvent.AFTER_INSERT)
@@ -1493,7 +1595,8 @@ class Table:
         self,
         cond: Optional[QueryLike] = None,
         limit: Optional[int] = None,
-        skip: int = 0
+        skip: int = 0,
+        include_metadata: bool = False
     ) -> List[Document]:
         """
         Get all soft-deleted documents, optionally filtered by a condition.
@@ -1506,11 +1609,16 @@ class Table:
         :param limit: maximum number of documents to return (default: no limit)
         :param skip: number of documents to skip from the beginning
                      (default: 0)
+        :param include_metadata: If True, include timestamp metadata fields
+                                (_created_at, _updated_at, _deleted_at) in
+                                the returned documents. This is useful for
+                                developers to track document changes for
+                                syncing or backup purposes. Default is False.
         :returns: a list of soft-deleted documents (without _deleted field)
         """
         # Use centralized _read_table with deleted_only=True to get
         # only soft-deleted documents (already has _deleted field stripped)
-        table = self._read_table(deleted_only=True)
+        table = self._read_table(deleted_only=True, include_metadata=include_metadata)
 
         # Build list of deleted documents, applying user condition if provided
         deleted_docs = [
@@ -1520,6 +1628,215 @@ class Table:
         ]
 
         return self._apply_pagination(deleted_docs, skip, limit)
+
+    def updated_since(
+        self,
+        timestamp: float,
+        cond: Optional[QueryLike] = None,
+        limit: Optional[int] = None,
+        skip: int = 0,
+        include_deleted: bool = False
+    ) -> List[Document]:
+        """
+        Get all documents that have been updated since the given timestamp.
+
+        This is useful for syncing or backup purposes, allowing developers
+        to query only documents that have changed since a specific point
+        in time.
+
+        Note: Documents that have never been updated (only created) will
+        not be returned by this method. Use :meth:`created_since` or
+        combine both queries to get all documents changed since a timestamp.
+
+        :param timestamp: Unix timestamp (seconds since epoch). Documents
+                         with _updated_at >= timestamp will be returned.
+        :param cond: optional additional condition to filter documents
+        :param limit: maximum number of documents to return (default: no limit)
+        :param skip: number of documents to skip from the beginning
+        :param include_deleted: If True, include soft-deleted documents.
+                               Default is False.
+        :returns: a list of documents updated since the given timestamp,
+                 including their metadata (_created_at, _updated_at, etc.)
+
+        Example usage:
+
+        >>> import time
+        >>> # Get documents updated in the last hour
+        >>> one_hour_ago = time.time() - 3600
+        >>> updated_docs = db.updated_since(one_hour_ago)
+        >>> # Get user documents updated in the last day
+        >>> one_day_ago = time.time() - 86400
+        >>> updated_users = db.updated_since(one_day_ago, where('type') == 'user')
+        """
+        # Read table with metadata included so we can filter by _updated_at
+        table = self._read_table(
+            include_deleted=include_deleted,
+            include_metadata=True
+        )
+
+        # Filter documents that have been updated since the timestamp
+        docs = [
+            self.document_class(doc, self.document_id_class(doc_id))
+            for doc_id, doc in table.items()
+            if doc.get(UPDATED_AT_KEY, 0) >= timestamp
+            and (cond is None or cond(doc))
+        ]
+
+        return self._apply_pagination(docs, skip, limit)
+
+    def created_since(
+        self,
+        timestamp: float,
+        cond: Optional[QueryLike] = None,
+        limit: Optional[int] = None,
+        skip: int = 0,
+        include_deleted: bool = False
+    ) -> List[Document]:
+        """
+        Get all documents that have been created since the given timestamp.
+
+        This is useful for syncing or backup purposes, allowing developers
+        to query only documents that were created since a specific point
+        in time.
+
+        :param timestamp: Unix timestamp (seconds since epoch). Documents
+                         with _created_at >= timestamp will be returned.
+        :param cond: optional additional condition to filter documents
+        :param limit: maximum number of documents to return (default: no limit)
+        :param skip: number of documents to skip from the beginning
+        :param include_deleted: If True, include soft-deleted documents.
+                               Default is False.
+        :returns: a list of documents created since the given timestamp,
+                 including their metadata (_created_at, _updated_at, etc.)
+
+        Example usage:
+
+        >>> import time
+        >>> # Get documents created in the last hour
+        >>> one_hour_ago = time.time() - 3600
+        >>> new_docs = db.created_since(one_hour_ago)
+        >>> # Get user documents created in the last day
+        >>> one_day_ago = time.time() - 86400
+        >>> new_users = db.created_since(one_day_ago, where('type') == 'user')
+        """
+        # Read table with metadata included so we can filter by _created_at
+        table = self._read_table(
+            include_deleted=include_deleted,
+            include_metadata=True
+        )
+
+        # Filter documents that have been created since the timestamp
+        docs = [
+            self.document_class(doc, self.document_id_class(doc_id))
+            for doc_id, doc in table.items()
+            if doc.get(CREATED_AT_KEY, 0) >= timestamp
+            and (cond is None or cond(doc))
+        ]
+
+        return self._apply_pagination(docs, skip, limit)
+
+    def deleted_since(
+        self,
+        timestamp: float,
+        cond: Optional[QueryLike] = None,
+        limit: Optional[int] = None,
+        skip: int = 0
+    ) -> List[Document]:
+        """
+        Get all soft-deleted documents that were deleted since the given
+        timestamp.
+
+        This is useful for syncing purposes, allowing developers to query
+        which documents were soft-deleted since a specific point in time.
+
+        :param timestamp: Unix timestamp (seconds since epoch). Documents
+                         with _deleted_at >= timestamp will be returned.
+        :param cond: optional additional condition to filter documents
+        :param limit: maximum number of documents to return (default: no limit)
+        :param skip: number of documents to skip from the beginning
+        :returns: a list of soft-deleted documents that were deleted since
+                 the given timestamp, including their metadata
+
+        Example usage:
+
+        >>> import time
+        >>> # Get documents deleted in the last hour
+        >>> one_hour_ago = time.time() - 3600
+        >>> recently_deleted = db.deleted_since(one_hour_ago)
+        >>> # Get user documents deleted in the last day
+        >>> one_day_ago = time.time() - 86400
+        >>> deleted_users = db.deleted_since(one_day_ago, where('type') == 'user')
+        """
+        # Read only soft-deleted documents with metadata
+        table = self._read_table(deleted_only=True, include_metadata=True)
+
+        # Filter documents that have been deleted since the timestamp
+        docs = [
+            self.document_class(doc, self.document_id_class(doc_id))
+            for doc_id, doc in table.items()
+            if doc.get(DELETED_AT_KEY, 0) >= timestamp
+            and (cond is None or cond(doc))
+        ]
+
+        return self._apply_pagination(docs, skip, limit)
+
+    def changed_since(
+        self,
+        timestamp: float,
+        cond: Optional[QueryLike] = None,
+        limit: Optional[int] = None,
+        skip: int = 0,
+        include_deleted: bool = False
+    ) -> List[Document]:
+        """
+        Get all documents that have been created or updated since the given
+        timestamp.
+
+        This is a convenience method that combines the results of
+        :meth:`created_since` and :meth:`updated_since`, returning any
+        document that has changed (either created or updated) since the
+        given timestamp.
+
+        This is particularly useful for syncing purposes, as it returns
+        all documents that need to be synchronized.
+
+        :param timestamp: Unix timestamp (seconds since epoch). Documents
+                         with _created_at >= timestamp OR _updated_at >= timestamp
+                         will be returned.
+        :param cond: optional additional condition to filter documents
+        :param limit: maximum number of documents to return (default: no limit)
+        :param skip: number of documents to skip from the beginning
+        :param include_deleted: If True, include soft-deleted documents.
+                               Default is False.
+        :returns: a list of documents changed since the given timestamp,
+                 including their metadata (_created_at, _updated_at, etc.)
+
+        Example usage:
+
+        >>> import time
+        >>> # Get all documents changed in the last hour
+        >>> one_hour_ago = time.time() - 3600
+        >>> changed_docs = db.changed_since(one_hour_ago)
+        >>> # Sync all user documents changed in the last day
+        >>> one_day_ago = time.time() - 86400
+        >>> changes = db.changed_since(one_day_ago, where('type') == 'user')
+        """
+        # Read table with metadata included
+        table = self._read_table(
+            include_deleted=include_deleted,
+            include_metadata=True
+        )
+
+        # Filter documents that have been created or updated since the timestamp
+        docs = [
+            self.document_class(doc, self.document_id_class(doc_id))
+            for doc_id, doc in table.items()
+            if (doc.get(CREATED_AT_KEY, 0) >= timestamp
+                or doc.get(UPDATED_AT_KEY, 0) >= timestamp)
+            and (cond is None or cond(doc))
+        ]
+
+        return self._apply_pagination(docs, skip, limit)
 
     def purge(
         self,
@@ -1893,7 +2210,8 @@ class Table:
     def _read_table(
         self,
         include_deleted: bool = False,
-        deleted_only: bool = False
+        deleted_only: bool = False,
+        include_metadata: bool = False
     ) -> Dict[str, Mapping]:
         """
         Read the table data from the underlying storage.
@@ -1902,13 +2220,18 @@ class Table:
         we may not want to convert *all* documents when returning
         only one document for example.
 
-        The returned documents always have the internal ``_deleted`` field
-        stripped so users never see implementation details.
+        The returned documents have internal metadata fields stripped by
+        default so users never see implementation details. Use
+        include_metadata=True to include timestamp metadata for
+        developer/debugging purposes.
 
         :param include_deleted: If True, include soft-deleted documents.
                                Default is False (exclude deleted documents).
         :param deleted_only: If True, return ONLY soft-deleted documents.
                             This takes precedence over include_deleted.
+        :param include_metadata: If True, include timestamp metadata fields
+                                (_created_at, _updated_at, _deleted_at) in
+                                the returned documents. Default is False.
         """
 
         # Retrieve the tables from the storage
@@ -1925,44 +2248,51 @@ class Table:
             # The table does not exist yet, so it is empty
             return {}
 
-        # Apply soft-delete filtering based on parameters and always strip
-        # the _deleted field so users never see internal implementation details
+        # Determine which keys to strip based on include_metadata
+        if include_metadata:
+            # Only strip the _deleted flag, keep timestamp metadata
+            def strip_keys(doc):
+                return {k: v for k, v in doc.items() if k != SOFT_DELETE_KEY}
+        else:
+            # Strip all internal metadata keys
+            strip_keys = self._strip_metadata_keys
+
+        # Apply soft-delete filtering based on parameters
         if deleted_only:
-            # Return only soft-deleted documents (with _deleted field stripped)
+            # Return only soft-deleted documents
             table = {
-                doc_id: self._strip_soft_delete_key(doc)
+                doc_id: strip_keys(doc)
                 for doc_id, doc in table.items()
                 if doc.get(SOFT_DELETE_KEY, False)
             }
         elif not include_deleted:
             # Exclude soft-deleted documents (default behavior)
-            # Non-deleted docs don't have _deleted field, but strip anyway
-            # for consistency
             table = {
-                doc_id: self._strip_soft_delete_key(doc)
+                doc_id: strip_keys(doc)
                 for doc_id, doc in table.items()
                 if not doc.get(SOFT_DELETE_KEY, False)
             }
         else:
-            # include_deleted=True: return all documents with _deleted stripped
+            # include_deleted=True: return all documents
             table = {
-                doc_id: self._strip_soft_delete_key(doc)
+                doc_id: strip_keys(doc)
                 for doc_id, doc in table.items()
             }
 
         return table
 
-    def _strip_soft_delete_key(self, doc: Mapping) -> dict:
+    def _strip_metadata_keys(self, doc: Mapping) -> dict:
         """
-        Return a copy of the document with the soft-delete key removed.
+        Return a copy of the document with all internal metadata keys removed.
 
         This ensures users don't see internal implementation details
-        in their documents.
+        (like _deleted, _created_at, _updated_at, _deleted_at) in their
+        documents during normal queries.
 
-        :param doc: The document to strip the key from
-        :returns: A new dict without the SOFT_DELETE_KEY
+        :param doc: The document to strip the keys from
+        :returns: A new dict without any METADATA_KEYS
         """
-        return {k: v for k, v in doc.items() if k != SOFT_DELETE_KEY}
+        return {k: v for k, v in doc.items() if k not in METADATA_KEYS}
 
     def _has_hooks(self, *events: HookEvent) -> bool:
         """
