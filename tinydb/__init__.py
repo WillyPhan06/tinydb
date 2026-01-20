@@ -33,6 +33,7 @@ from .validation import ValidationError, FieldValidator, Schema
 from .importexport import export_csv, import_csv, export_jsonl, import_jsonl
 from .profiling import QueryProfiler, QueryStats, QuerySummary
 from .transactions import Transaction, TransactionError
+from .indexing import Index, IndexManager, UnhashableValueError
 from .version import __version__
 
 __all__ = (
@@ -56,4 +57,7 @@ __all__ = (
     'QuerySummary',
     'Transaction',
     'TransactionError',
+    'Index',
+    'IndexManager',
+    'UnhashableValueError',
 )

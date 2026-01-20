@@ -24,6 +24,7 @@ from .storages import Storage
 from .utils import LRUCache
 from .hooks import HookEvent, HookManager
 from .validation import Schema, FieldValidator, ValidationError
+from .indexing import IndexManager
 
 # Import TYPE_CHECKING to avoid circular imports
 from typing import TYPE_CHECKING
@@ -140,6 +141,7 @@ class Table:
         self._hooks = hooks
         self._schema: Optional[Schema] = None
         self._profiler: Optional['QueryProfiler'] = profiler
+        self._index_manager = IndexManager()
 
         self._next_id = None
         if persist_empty:
@@ -279,6 +281,111 @@ class Table:
         Remove all validation rules from this table.
         """
         self._schema = None
+
+    def create_index(self, field_name: str) -> None:
+        """
+        Create an index on a field for faster queries.
+
+        Indexes significantly speed up queries that filter on the indexed
+        field, especially for large tables. The index is automatically
+        maintained when documents are inserted, updated, or deleted.
+
+        :param field_name: The field to index. Supports dot notation for
+                          nested fields (e.g., 'address.city').
+        :raises ValueError: If an index already exists for this field
+
+        Example usage:
+
+        >>> from tinydb import TinyDB, where
+        >>> db = TinyDB('db.json')
+        >>> table = db.table('users')
+        >>>
+        >>> # Create an index on user_id for fast lookups
+        >>> table.create_index('user_id')
+        >>>
+        >>> # Queries on indexed fields are much faster
+        >>> table.search(where('user_id') == 'user123')
+        >>>
+        >>> # Index nested fields
+        >>> table.create_index('address.city')
+        >>> table.search(where('address')['city'] == 'New York')
+        """
+        # Read all documents to populate the index
+        table_data = self._read_table(include_deleted=True)
+        # Convert string keys to document_id_class
+        documents = {
+            self.document_id_class(doc_id): doc
+            for doc_id, doc in table_data.items()
+        }
+        self._index_manager.create_index(field_name, documents)
+
+    def drop_index(self, field_name: str) -> None:
+        """
+        Remove an index from a field.
+
+        After dropping an index, queries on this field will perform full
+        table scans again. This can be useful to free memory or when the
+        index is no longer needed.
+
+        :param field_name: The field whose index to remove
+        :raises ValueError: If no index exists for this field
+
+        Example usage:
+
+        >>> table.drop_index('user_id')
+        """
+        self._index_manager.drop_index(field_name)
+
+    def list_indexes(self) -> List[str]:
+        """
+        List all indexed fields.
+
+        :returns: A list of field names that have indexes
+
+        Example usage:
+
+        >>> table.create_index('user_id')
+        >>> table.create_index('email')
+        >>> table.list_indexes()
+        ['user_id', 'email']
+        """
+        return self._index_manager.list_indexes()
+
+    def has_index(self, field_name: str) -> bool:
+        """
+        Check if an index exists for a field.
+
+        :param field_name: The field to check
+        :returns: True if an index exists, False otherwise
+
+        Example usage:
+
+        >>> table.create_index('user_id')
+        >>> table.has_index('user_id')
+        True
+        >>> table.has_index('email')
+        False
+        """
+        return self._index_manager.has_index(field_name)
+
+    def rebuild_indexes(self) -> None:
+        """
+        Rebuild all indexes from the current table data.
+
+        This can be useful if indexes become out of sync (e.g., after
+        manual storage modifications) or to reclaim memory after many
+        deletions.
+
+        Example usage:
+
+        >>> table.rebuild_indexes()
+        """
+        table_data = self._read_table(include_deleted=True)
+        documents = {
+            self.document_id_class(doc_id): doc
+            for doc_id, doc in table_data.items()
+        }
+        self._index_manager.rebuild_all(documents)
 
     def _validate_document(self, document: Mapping) -> None:
         """
@@ -551,16 +658,42 @@ class Table:
             include_deleted=include_deleted,
             include_metadata=include_metadata
         )
-        docs_scanned = len(table_data)
 
-        # Perform the search by applying the query to all documents.
-        # Then, only if the document matches the query, convert it
-        # to the document class and document ID class.
-        docs = [
-            self.document_class(doc, self.document_id_class(doc_id))
-            for doc_id, doc in table_data.items()
-            if cond(doc)
-        ]
+        # Try to use indexes for faster lookup
+        # We only use indexes when not including deleted docs (indexes don't
+        # track soft-deleted documents separately)
+        indexed_doc_ids = None
+        if not include_deleted and self._index_manager.list_indexes():
+            # Get the query hash for index lookup
+            query_hash = getattr(cond, '_hash', None)
+            if query_hash is not None:
+                all_doc_ids = set(self.document_id_class(d) for d in table_data.keys())
+                indexed_doc_ids = self._index_manager.try_execute_query(
+                    query_hash, all_doc_ids
+                )
+
+        if indexed_doc_ids is not None:
+            # Use indexed results - only scan matching documents
+            docs_scanned = len(indexed_doc_ids)
+            docs = [
+                self.document_class(
+                    table_data[str(doc_id)],
+                    doc_id
+                )
+                for doc_id in indexed_doc_ids
+                if str(doc_id) in table_data and cond(table_data[str(doc_id)])
+            ]
+        else:
+            # Fall back to full table scan
+            docs_scanned = len(table_data)
+            # Perform the search by applying the query to all documents.
+            # Then, only if the document matches the query, convert it
+            # to the document class and document ID class.
+            docs = [
+                self.document_class(doc, self.document_id_class(doc_id))
+                for doc_id, doc in table_data.items()
+                if cond(doc)
+            ]
 
         # Record profiling data
         if self._profiler and start_time is not None:
@@ -797,24 +930,55 @@ class Table:
                 include_deleted=include_deleted,
                 include_metadata=include_metadata
             )
-            docs_scanned = len(table_data)
 
-            for doc_id_, doc in table_data.items():
-                if cond(doc):
-                    # Record profiling data
-                    if self._profiler and start_time is not None:
-                        execution_time_ms = (time.perf_counter() - start_time) * 1000
-                        self._profiler.record_query(
-                            table_name=self._name,
-                            query=cond,
-                            execution_time_ms=execution_time_ms,
-                            docs_scanned=docs_scanned,
-                            docs_matched=1
-                        )
-                    return self.document_class(
-                        doc,
-                        self.document_id_class(doc_id_)
+            # Try to use indexes for faster lookup
+            indexed_doc_ids = None
+            if not include_deleted and self._index_manager.list_indexes():
+                query_hash = getattr(cond, '_hash', None)
+                if query_hash is not None:
+                    all_doc_ids = set(self.document_id_class(d) for d in table_data.keys())
+                    indexed_doc_ids = self._index_manager.try_execute_query(
+                        query_hash, all_doc_ids
                     )
+
+            if indexed_doc_ids is not None:
+                # Use indexed results - scan only matching docs
+                docs_scanned = len(indexed_doc_ids)
+                for doc_id_ in indexed_doc_ids:
+                    str_doc_id = str(doc_id_)
+                    if str_doc_id in table_data:
+                        doc = table_data[str_doc_id]
+                        if cond(doc):
+                            # Record profiling data
+                            if self._profiler and start_time is not None:
+                                execution_time_ms = (time.perf_counter() - start_time) * 1000
+                                self._profiler.record_query(
+                                    table_name=self._name,
+                                    query=cond,
+                                    execution_time_ms=execution_time_ms,
+                                    docs_scanned=docs_scanned,
+                                    docs_matched=1
+                                )
+                            return self.document_class(doc, doc_id_)
+            else:
+                # Fall back to full table scan
+                docs_scanned = len(table_data)
+                for doc_id_, doc in table_data.items():
+                    if cond(doc):
+                        # Record profiling data
+                        if self._profiler and start_time is not None:
+                            execution_time_ms = (time.perf_counter() - start_time) * 1000
+                            self._profiler.record_query(
+                                table_name=self._name,
+                                query=cond,
+                                execution_time_ms=execution_time_ms,
+                                docs_scanned=docs_scanned,
+                                docs_matched=1
+                            )
+                        return self.document_class(
+                            doc,
+                            self.document_id_class(doc_id_)
+                        )
 
             # Record profiling data (no match found)
             if self._profiler and start_time is not None:
@@ -2361,8 +2525,33 @@ class Table:
             for doc_id, doc in raw_table.items()
         }
 
+        # Capture state before update for index maintenance
+        has_indexes = bool(self._index_manager.list_indexes())
+        old_doc_ids = set(table.keys()) if has_indexes else set()
+
         # Perform the table update operation
         updater(table)
+
+        # Update indexes based on changes
+        if has_indexes:
+            new_doc_ids = set(table.keys())
+
+            # Find removed, added, and potentially updated documents
+            removed_ids = old_doc_ids - new_doc_ids
+            added_ids = new_doc_ids - old_doc_ids
+            common_ids = old_doc_ids & new_doc_ids
+
+            # Remove deleted documents from indexes
+            for doc_id in removed_ids:
+                self._index_manager.on_remove(doc_id)
+
+            # Add new documents to indexes
+            for doc_id in added_ids:
+                self._index_manager.on_insert(doc_id, table[doc_id])
+
+            # Update existing documents (their content may have changed)
+            for doc_id in common_ids:
+                self._index_manager.on_update(doc_id, table[doc_id])
 
         # Convert the document IDs back to strings.
         # This is required as some storages (most notably the JSON file format)
